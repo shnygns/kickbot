@@ -1,8 +1,7 @@
 # KickBot - Your Partner in Lurker-Slaughter
 ### Authored by Shinanygans (shinanygans@proton.me)
 
-This bot will gather data over time about which users are in your group and the last time they posted media.
-You can command this bot to eject from your group those who have not posted in a given time span or have never posted.
+This bot will gather data over time about which users are in your group and the last time they posted media. You can command this bot to eject from your group those who have not posted in a given time span or have never posted.
 
 ## Prerequisites
 
@@ -90,13 +89,9 @@ Follow these steps to set up your project:
 
 
 7. IMPORTANT - Configure named admins in config.py:
-This bot works by vacuuming up information on users and posts that it sees in your groups. It stories these data in a
-SQLite flat file. If other people find your KickBot through a Telegram search and run it in their rooms, THEIR DATA WILL BE
-STORED IN YOUR DATABASE! This is no bueno.
+This bot works by vacuuming up information on users and posts that it sees in your groups. It stories these data in a SQLite flat file. If other people find your KickBot through a Telegram search and run it in their rooms, THEIR DATA WILL BE STORED IN YOUR DATABASE! This is no bueno. 
 
-To stop this from happening, put your Telegram user_id in the AUTHORIZED_ADMINS list in config.py. If there are user_ids in 
-this list, then only these user_ids will be able to issue bot commands, and the bot will only vacuum up information from chats
-in which at least one user_id on this list is an admin. Problem solved.
+To stop this from happening, put your Telegram user_id in the AUTHORIZED_ADMINS list in config.py. If there are user_ids in this list, then only these user_ids will be able to issue bot commands, and the bot will only vacuum up information from chats in which at least one user_id on this list is an admin. Problem solved.
 
 AUTHORIZED_ADMINS = [XXXXXXXXXX, XXXXXXXXXX]
 
@@ -123,40 +118,37 @@ To run your Telegram bot, you'll need a Bot Token from the Telegram BotFather. F
 
 ## Usage
 
-Invite this bot to your group as an admin. Make sure the bot's settings in Bot Father give it full privilidges.
-The bot will store user information in its database as people interact in your group.
+Invite this bot to your group as an admin. Make sure the bot's settings in Bot Father give it full privilidges. The bot will store user information in its database as people interact in your group.
 
 When people upload media (pics, videos and other documents), kickbot will track the most recent timestamp.
 
-When a group admin issues the /inactivekick <time> command (like "/inactivekick 1d"), the bot search its database for known
-users who have not posted media within that timeframe or have never posted media. 
+When a group admin issues the /inactivekick <time> command (like "/inactivekick 1d"), the bot search its database for known users who have not posted media within that timeframe or have never posted media. 
 
-They will be kicked from the group, and you will be given a summary of the number of people kicked. If you kick fewer than 10 users,
-you will see them named individually.
+They will be kicked from the group, and you will be given a summary of the number of people kicked. If you kick fewer than 10 users, you will see them named individually.
 
 Here are some of the commands you can use:
 
-/help - Show this help message.\n\n"
-/inactivekick <time> - Kick inactive users who haven't posted media in the specified time.
-/pretendkick <time> - Simulate kicking inactive users without actually kicking them.
+/help - Show this help message.
+
+/inactivekick (time) - Kick inactive users who haven't posted media in the specified time.
+
+/pretendkick (time) - Simulate kicking inactive users without actually kicking them.
 
 For example, the command /inactivekick 1d would kick all who have not posted in the last day, or who have never posted.
 
-<time> units use (s)econds, (m)inutes, (h)ours, (d)ays, (M)onths, or (y)ears.
+(Time) units use (s)econds, (m)inutes, (h)ours, (d)ays, (M)onths, or (y)ears.
 
 
 ## Configuration and Features
 
-Do NOT forget to make a copy of sample-config.py and call it config.py. The program will error out if you don't. 
-The config file is where you store your bot token from Bot Father. But you can also configure other special features!
+Do NOT forget to make a copy of sample-config.py and call it config.py. The program will error out if you don't.  The config file is where you store your bot token from Bot Father. But you can also configure other special features!
 
 
 ### Authorized Admins
 
 AUTHORIZED_ADMINS = [XXXXXXXXXX, XXXXXXXXXX]
 
-If this list is empty, your bot may be used by anyone who is an admin in a chat where the bot is operating. You can fill this 
-list with authorized User IDs (separated by commas, no quotes) that are acceptable for use. 
+If this list is empty, your bot may be used by anyone who is an admin in a chat where the bot is operating. You can fill this list with authorized User IDs (separated by commas, no quotes) that are acceptable for use. 
 
 Only those users listed will be able to command the bot, and the bot will only work in rooms where someone on the list is an admin.
 
@@ -167,14 +159,12 @@ DEBUG_CHATS = [-XXXXXXXXXX, -100XXXXXXXXXX]
 
 Sometimes you may want to test KickBot in a small group before rolling it out to a bigger group.
 
-Chats in this list will receive special debug messages in the chat when certain events are triggered.
-These debug messages are visible only in the chats listed.
+Chats in this list will receive special debug messages in the chat when certain events are triggered. These debug messages are visible only in the chats listed.
 
 
 ### Message Configuration
 
-You have total control over the messages that Kickbot issues. I've included some sample messaging for fun. Those messages
-can be changed in the config.py file.
+You have total control over the messages that Kickbot issues. I've included some sample messaging for fun. Those messages can be changed in the config.py file.
 
 
 ## License
@@ -188,8 +178,7 @@ This bot was built using the python-telegram-bot library and API wrapper. It als
 
 
 ## Support
-This script is provided AS-IS without warranties of any kind. I am exceptionally lazy, and fixes/improvements will proceed in
-direct proportion to how much I like you.
+This script is provided AS-IS without warranties of any kind. I am exceptionally lazy, and fixes/improvements will proceed in direct proportion to how much I like you.
 
 "Son...you're on your own." --Blazing Saddles
 
