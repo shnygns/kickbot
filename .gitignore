@@ -1,0 +1,7 @@
+config.py
+check-sql.py
+__pycache__
+*.db
+*.log
+*.session
+.vscode
