@@ -11,6 +11,7 @@ You can command this bot to eject from your group those who have not posted in a
 import logging
 import sqlite3
 import asyncio
+import pytz
 
 from config import (
     BOT_TOKEN,
@@ -29,6 +30,7 @@ from functools import wraps
 from tqdm import tqdm
 from telegram import Update, ChatMember
 from telegram.constants import ChatType
+from telegram.error import RetryAfter
 from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
@@ -82,16 +84,33 @@ with sqlite3.connect("user_activity.db") as conn:
     )
     conn.commit()
 
+max_retries = 3
+authorized_chats = set()
+utc_timezone = pytz.utc
 
 # Custom decorator function to check if the requesting user is authorized (use for commands).
 def authorized_admin_check(handler_function):
     @wraps(handler_function)
     async def wrapper(update: Update, context: CallbackContext):
-        user_id = update.effective_user.id
-        if AUTHORIZED_ADMINS and user_id not in AUTHORIZED_ADMINS:
-            return 
-        else:
-            return await handler_function(update, context)
+        rt = 0
+        while rt < max_retries:
+            try:
+                user_id = update.effective_user.id
+                if AUTHORIZED_ADMINS and user_id not in AUTHORIZED_ADMINS:
+                    return 
+                else:
+                    return await handler_function(update, context)
+            except RetryAfter as e:
+                wait_seconds = e.retry_after
+                logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
+                asyncio.sleep(wait_seconds)
+                rt += 1
+                if rt == max_retries:
+                    logging.warning(f"Max retry limit reached. Message not sent.")
+                    raise e
+            except Exception as e:
+                logging.warning(f"An error occured in authorized_admin_check(): {e}")
+                break
     return wrapper
 
 
@@ -99,16 +118,41 @@ def authorized_admin_check(handler_function):
 def authorized_chat_check(handler_function):
     @wraps(handler_function)
     async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
-        chat_id = update.effective_chat.id
-        admins = await update.effective_chat.get_administrators()
-        admin_ids = {admin.user.id for admin in admins}
-        set_admin_ids = set(admin_ids)
-        set_auth_admins = set(AUTHORIZED_ADMINS)
-        if AUTHORIZED_ADMINS and set_auth_admins.intersection(set_admin_ids) == False:
-            await context.bot.send_message(chat_id=chat_id, text="I'm sorry, this bot is private.")
-            return 
-        else:
+        
+        # If no authorized admins are in the list, the bot is open. Check passed.
+        if not AUTHORIZED_ADMINS:
             return await handler_function(update, context, *args, **kwargs)
+        
+        # If there are admins on the list and this process has already approved a chat, check passed.
+        global authorized_chats
+        chat_id = update.effective_chat.id
+        if chat_id in authorized_chats:
+            return await handler_function(update, context, *args, **kwargs)
+        
+        # If there are admins and this chat is not pre-approved, get the chat admins and see if there's a match.
+        rt = 0
+        while rt < max_retries:
+            try:      
+                admins = await update.effective_chat.get_administrators()
+                admin_ids = {admin.user.id for admin in admins}
+                set_admin_ids = set(admin_ids)
+                set_auth_admins = set(AUTHORIZED_ADMINS)
+                if set_auth_admins.intersection(set_admin_ids):
+                    authorized_chats.add(chat_id)
+                    return await handler_function(update, context, *args, **kwargs)
+                else:
+                    return 
+            except RetryAfter as e:
+                wait_seconds = e.retry_after
+                logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
+                asyncio.sleep(wait_seconds)
+                rt += 1
+                if rt == max_retries:
+                    logging.warning(f"Max retry limit reached. Message not sent.")
+                    raise e
+            except Exception as e:
+                logging.warning(f"An error occured in authorized_admin_check(): {e}")
+                break
     return wrapper
 
 
@@ -135,7 +179,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     status_change = member.difference().get("status")
     old_is_member, new_is_member = member.difference().get("is_member", (None, None))
-
+ 
     if status_change is None:
         return None
     
@@ -153,14 +197,8 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ] or (new_status == ChatMember.RESTRICTED and new_is_member is True)
 
     if not was_member and is_member:
-        try:
-            chat_member = await context.bot.get_chat_member(chat_id, user_id)
-            user = chat_member.user
-            user_name = user.first_name + (" " + user.last_name if user.last_name else "")
-        except Exception as e:
-            logging.exception(f"An error occured in handle_entry() - get_chat_member() failed for User {user_id} in chat {chat_id}: {e}")
-        if not chat_member.status in ["administrator", "creator"]:
-            logging.warning(f"User ID {user_id} '{user_name}' entered chat {chat_id} '{chat_name}'. Not admin. Capturing.")
+        if not member.new_chat_member.status in ["administrator", "creator"]:
+            logging.info(f"User ID {user_id} '{user_name}' entered chat {chat_id} '{chat_name}'. Not admin. Capturing.")
             await capture_user(context, user_id, chat_id, user_name, chat_name)
         else:
             logging.info(f"User ID {user_id} '{user_name}' entered chat {chat_id} '{chat_name}'. Admin. Ignoring.")
@@ -169,32 +207,45 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Check if it's a media message (photo, video, etc.) and update user activity
 @authorized_chat_check
 async def handle_message(update: Update, context: CallbackContext): 
-    try:
-        chat_id = update.effective_message.chat_id
-        chat_name = update.effective_chat.title
-        user_id = update.effective_user.id
+    rt = 0
+    while rt < max_retries:
         try:
-            chat_member = await context.bot.get_chat_member(chat_id, user_id)
-            user = chat_member.user
+            chat_id = update.effective_message.chat_id
+            chat_name = update.effective_chat.title
+            user = update.effective_user
+            user_id = user.id
             user_name = user.first_name + (" " + user.last_name if user.last_name else "")
-        except Exception as e:
-            logging.exception(f"An error occured in handle_entry() - get_chat_member() failed for User {user_id} in chat {chat_id} '{chat_name}': {e}")
-       
-        logging.info(f"User ID {user_id} '{user_name}' activity in chat {chat_id} '{chat_name}'. Checking DB.")
-        await capture_user(context, user_id, chat_id, user_name, chat_name)
-        if update.effective_message.document or update.effective_message.photo or update.effective_message.video:
-            chat_member = await context.bot.get_chat_member(chat_id, user_id)
-            if not chat_member.status in ["administrator", "creator"]:
-                logging.warning(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' contains acceptable media and is not an admin. Updating last activity in DB")
-                await debug_message(context, chat_id, user_name, DEBUG_UPDATE_MESSAGE)
-                update_user_activity(user_id, chat_id)
+
+            # No matter what the message contains, capture the sender in the DB 
+            logging.info(f"User ID {user_id} '{user_name}' activity in chat {chat_id} '{chat_name}'. Checking DB.")
+            await capture_user(context, user_id, chat_id, user_name, chat_name)
+
+            # If the message contained acceptable media, process further
+            if update.effective_message.document or update.effective_message.photo or update.effective_message.video:
+                date = update.effective_message.date
+                chat_member = await context.bot.get_chat_member(chat_id, user_id)
+
+                # If the sender was not an admin, update the last_activity in the database
+                if not chat_member.status in ["administrator", "creator"]:
+                    logging.warning(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' contains acceptable media and is not an admin. Updating last activity in DB")
+                    await debug_message(context, chat_id, user_name, DEBUG_UPDATE_MESSAGE)
+                    update_user_activity(user_id, chat_id, date)
+                else:
+                    logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' contains acceptable media but is an admin. Ignoring.")
+                    await debug_message(context, chat_id, user_name, DEBUG_ADMIN_MESSAGE)
             else:
-                logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' contains acceptable media but is an admin. Ignoring.")
-                await debug_message(context, chat_id, user_name, DEBUG_ADMIN_MESSAGE)
-        else:
-            logging.info(f"User ID {user_id} '{user_name}' post in chat {chat_id} '{chat_name}' does NOT contain acceptable media. No activity update.")
-    except Exception as e:
-        logging.exception(f"An error occured in handle_message() parsing a post for db entry: {e}")        
+                logging.info(f"User ID {user_id} '{user_name}' post in chat {chat_id} '{chat_name}' does NOT contain acceptable media. No activity update.")
+            break
+        except RetryAfter as e:
+                wait_seconds = e.retry_after
+                logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
+                asyncio.sleep(wait_seconds)
+                rt += 1
+                if rt == max_retries:
+                    logging.warning(f"Max retry limit reached. Message not sent.")
+                    raise e
+        except Exception as e:
+            logging.exception(f"An error occured in handle_message() parsing a post for db entry: {e}")        
 
 
 # Send special debug messages into the chats in the DEBUG_CHATS groups (config.py)
@@ -237,7 +288,7 @@ async def capture_user(context, user_id, chat_id, user_name, chat_name):
                     (user_id, chat_id),
                 )
                 conn.commit()
-                logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' was just added to the database.")
+                logging.warning(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' was just added to the database.")
                 await debug_message(context, chat_id, user_name, DEBUG_CAPTURE_MESSAGE)
             else:
                 # The combination already exists
@@ -249,22 +300,46 @@ async def capture_user(context, user_id, chat_id, user_name, chat_name):
 
 
 # Function to update the last_activity timestamp for a user_id / chat_id combination when someone posts media
-def update_user_activity(user_id, channel_id):
+def update_user_activity(user_id, channel_id, date):
     try:
         with sqlite3.connect("user_activity.db") as conn:
             cursor = conn.cursor()
 
-            now = datetime.now()
+            # Check if the provided date is newer than the last_activity in the database
             cursor.execute(
                 """
-                INSERT OR REPLACE INTO user_activity (user_id, channel_id, last_activity)
-                VALUES (?, ?, ?)
+                SELECT last_activity FROM user_activity
+                WHERE user_id = ? AND channel_id = ?
                 """,
-                (user_id, channel_id, now),
+                (user_id, channel_id),
             )
-            conn.commit()
+            row = cursor.fetchone()
+            
+            if row:
+                last_activity = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone) if row[0] else None
+                if last_activity is None or date.timestamp() > last_activity.timestamp():
+                    cursor.execute(
+                        """
+                        INSERT OR REPLACE INTO user_activity (user_id, channel_id, last_activity)
+                        VALUES (?, ?, ?)
+                        """,
+                        (user_id, channel_id, date.strftime("%Y-%m-%d %H:%M:%S.%f")),
+                    )
+                    conn.commit()
+            else:
+                # The combination doesn't exist, so insert it with the provided date
+                cursor.execute(
+                    """
+                    INSERT INTO user_activity (user_id, channel_id, last_activity)
+                    VALUES (?, ?, ?)
+                    """,
+                    (user_id, channel_id, date.strftime("%Y-%m-%d %H:%M:%S.%f")),
+                )
+                conn.commit()
+
     except Exception as e:
-        logging.exception(f"An error occured in update user activity() updating a last_activity record: {e}")    
+        logging.exception(f"An error occurred in update_user_activity() updating a last_activity record: {e}")
+ 
 
 
 # Command to begin the kick inactive users process. Starts a separate async event loop.
@@ -299,14 +374,18 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         issuer_user_id = update.effective_user.id
         issuer_chat_id = update.message.chat_id
         issuer_chat_name = update.effective_chat.title
-        issuer_chat_member = await context.bot.get_chat_member(issuer_chat_id, issuer_user_id)
+        #issuer_chat_member = await context.bot.get_chat_member(issuer_chat_id, issuer_user_id)
         issuer_chat_type = update.effective_chat.type
         admins = await update.effective_chat.get_administrators()
         admin_ids = {admin.user.id for admin in admins}
 
-        if issuer_chat_member.status not in {"administrator", "creator"}:
+        if issuer_user_id not in admin_ids:
             await context.bot.send_message(chat_id=issuer_chat_id, text="You are not an admin in this channel.")
             return
+        
+        #if issuer_chat_member.status not in {"administrator", "creator"}:
+        #    await context.bot.send_message(chat_id=issuer_chat_id, text="You are not an admin in this channel.")
+        #    return
 
         logging.warning(f"HEADS UP! A valid inactivity purge has been started in {issuer_chat_name}")
 
@@ -372,48 +451,58 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
 
             # Convert the last_activity string to a datetime object
             last_activity = datetime.strptime(last_activity_str, "%Y-%m-%d %H:%M:%S.%f") if last_activity_str else None
+            rt = 0
+            while rt < max_retries:
+                try:
+                    # Get the user's name and add it to the kicked_users_info list
+                    member = await context.bot.get_chat_member(issuer_chat_id, user_id)
+                    user = member.user
+                    user_name = user.first_name + (" " + user.last_name if user.last_name else "")
 
-            try:
-                # Get the user's name and add it to the kicked_users_info list
-                member = await context.bot.get_chat_member(issuer_chat_id, user_id)
-                user = member.user
-                user_name = user.first_name + (" " + user.last_name if user.last_name else "")
-
-                # Ban the user
-                if not member.status in ["administrator", "creator"]:
-                    if not pretend:
-                        await context.bot.ban_chat_member(issuer_chat_id, user_id)
-
-                        # Remove the user's most recent post entry for this chat_id from the database
-                        cursor.execute(
-                            """
-                            DELETE FROM user_activity
-                            WHERE user_id = ? AND channel_id = ?
-                            """,
-                            (user_id, issuer_chat_id),
-                        )
-                        conn.commit()
-
-                    logging.warning(f"KICKED {user_name} from {issuer_chat_name}")
-                    last_activity_str = last_activity.strftime("%Y-%m-%d %H:%M:%S") if last_activity else None
-                    banned_users_info.append((user_name, last_activity_str))
-                    banned_count += 1
-
-                    if last_activity_str is None:
-                        await debug_message(context, issuer_chat_id, user_name, DEBUG_NEVER_POSTED, last_activity_str=last_activity_str, user_id=user_id)
-                    else:
-                        await debug_message(context, issuer_chat_id, user_name, DEBUG_INACTIVE_PURGE, last_activity_str=last_activity_str, user_id=user_id)
-
-                    if issuer_chat_type == ChatType.SUPERGROUP or issuer_chat_type == ChatType.CHANNEL:
+                    # Ban the user
+                    if not member.status in ["administrator", "creator"]:
                         if not pretend:
-                            await context.bot.unban_chat_member(issuer_chat_id, user_id)
-                        await debug_message(context, issuer_chat_id, user_name, "User has been successfully unbanned.")
-                    else:
-                        await debug_message(context, issuer_chat_id, user_name, "Since this is not a channel or supergroup, the ban is permanent.")
+                            await context.bot.ban_chat_member(issuer_chat_id, user_id)
 
-            except Exception as e:
-                await context.bot.send_message(chat_id=issuer_chat_id, text=f"Failed to kick user {user_id}. Error: {e}")
-                logging.exception(f"An error occurred in kick_inactive_users() during the ban process: {e}")
+                            # Remove the user's most recent post entry for this chat_id from the database
+                            cursor.execute(
+                                """
+                                DELETE FROM user_activity
+                                WHERE user_id = ? AND channel_id = ?
+                                """,
+                                (user_id, issuer_chat_id),
+                            )
+                            conn.commit()
+
+                        logging.warning(f"KICKED {user_name} from {issuer_chat_name}")
+                        last_activity_str = last_activity.strftime("%Y-%m-%d %H:%M:%S") if last_activity else None
+                        banned_users_info.append((user_name, last_activity_str))
+                        banned_count += 1
+
+                        if last_activity_str is None:
+                            await debug_message(context, issuer_chat_id, user_name, DEBUG_NEVER_POSTED, last_activity_str=last_activity_str, user_id=user_id)
+                        else:
+                            await debug_message(context, issuer_chat_id, user_name, DEBUG_INACTIVE_PURGE, last_activity_str=last_activity_str, user_id=user_id)
+
+                        if issuer_chat_type == ChatType.SUPERGROUP or issuer_chat_type == ChatType.CHANNEL:
+                            if not pretend:
+                                await context.bot.unban_chat_member(issuer_chat_id, user_id)
+                            await debug_message(context, issuer_chat_id, user_name, "User has been successfully unbanned.")
+                        else:
+                            await debug_message(context, issuer_chat_id, user_name, "Since this is not a channel or supergroup, the ban is permanent.")
+                        break
+                except RetryAfter as e:
+                    wait_seconds = e.retry_after
+                    logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
+                    asyncio.sleep(wait_seconds)
+                    rt += 1
+                    if rt == max_retries:
+                        logging.warning(f"Max retry limit reached. Message not sent.")
+                        raise e
+                except Exception as e:
+                    await context.bot.send_message(chat_id=issuer_chat_id, text=f"Failed to kick user {user_id}. Error: {e}")
+                    logging.exception(f"An error occurred in kick_inactive_users() during the ban process: {e}")
+                    break
 
     except Exception as e:
         await context.bot.send_message(chat_id=issuer_chat_id, text=f"Failed to kick users. Error: {e}")
@@ -445,7 +534,6 @@ def main() -> None:
 
     # Run the bot until the user presses Ctrl-C
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 
 if __name__ == "__main__":
