@@ -176,6 +176,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 This bot was built using the python-telegram-bot library and API wrapper. It also uses tqdm for its progress bars.
 
+One python-telegram-bot example bots - chatmemberbot.py - was the model for the function that detence entering/exiting a group:
+https://github.com/python-telegram-bot/python-telegram-bot/blob/master/examples/chatmemberbot.py 
+
 
 ## Support
 This script is provided AS-IS without warranties of any kind. I am exceptionally lazy, and fixes/improvements will proceed in direct proportion to how much I like you.
