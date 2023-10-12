@@ -269,7 +269,7 @@ async def handle_message(update: Update, context: CallbackContext):
                     logging.warning(f"Max retry limit reached. Message not sent.")
                     raise e
         except Exception as e:
-            logging.exception(f"An error occured in handle_message() parsing a post for db entry: {e}")        
+            logging.error(f"An error occured in handle_message() parsing a post for db entry: {e}")        
     return
 
 
@@ -321,7 +321,7 @@ async def capture_user(context, user_id, chat_id, user_name, chat_name):
                 conn.rollback()  # Roll back the transaction to discard the changes
                 logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' was already in the database and was ignored.")
     except Exception as e:
-        logging.exception(f"An error occurred in capture_user() checking a user against the db: {e}")
+        logging.error(f"An error occurred in capture_user() checking a user against the db: {e}")
     return
 
 
@@ -364,7 +364,7 @@ def update_user_activity(user_id, channel_id, date):
                 conn.commit()
 
     except Exception as e:
-        logging.exception(f"An error occurred in update_user_activity() updating a last_activity record: {e}")
+        logging.error(f"An error occurred in update_user_activity() updating a last_activity record: {e}")
     return
 
 
@@ -436,7 +436,7 @@ async def clean_database(update, context):
             await context.bot.send_message(chat_id=issuer_chat_id, text = active_str)
             return
     except Exception as e:
-        logging.exception(f"An error occured while cleaning the database: {e}")
+        logging.error(f"An error occured while cleaning the database: {e}")
     return
 
 
@@ -472,7 +472,7 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                     logging.warning(f"Max retry limit reached. Message not sent.")
                     raise e
             except Exception as e:
-                logging.exception(f"An error occurred in kick_inactive_users() during the ban process: {e}")
+                logging.error(f"An error occurred in kick_inactive_users() during the ban process: {e}")
                 break
 
     return banned_count
@@ -507,7 +507,7 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
             await context.bot.send_message(chat_id=issuer_chat_id, text="You are not an admin in this channel.")
             return
 
-        logging.warning(f"\n\nHEADS UP! A valid inactivity purge has been started in {issuer_chat_name}\n\n")
+        logging.warning(f"\n\nHEADS UP! A valid inactivity purge has been started in {issuer_chat_name} ({issuer_chat_id})\n\n")
 
         time_span = context.args[0]
         unit = time_span[-1]
@@ -525,7 +525,7 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         logging.warning(f"Requested duration is {readable_string_of_duration}. Cutoff date is {cutoff_date}.")
     except (IndexError, ValueError):
         await context.bot.send_message(chat_id=issuer_chat_id, text="Invalid command format. Use /inactivekick <time> (e.g., /inactivekick 1d).")
-        logging.exception(f"An error occurred in kick_inactive_users(), probably due to an invalid time argument.")
+        logging.error(f"An error occurred in kick_inactive_users(), probably due to an invalid time argument.")
         kick_started = False
         return
     
@@ -557,7 +557,7 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         await context.bot.send_message(chat_id=issuer_chat_id, text=admin_message)
 
     except (IndexError, ValueError) as e:
-        logging.exception(f"An error occurred in kick_inactive_users(), while assembling the kick list. {e}")
+        logging.error(f"An error occurred in kick_inactive_users(), while assembling the kick list. {e}")
         kick_started = False
         return
     
@@ -600,17 +600,18 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         # Construct the SQL query with placeholders
         delete_query = """
             DELETE FROM user_activity
-            WHERE (user_id, channel_id) IN ({})
-        """.format(','.join(['(?, ?)'] * len(delete_params)))
+            WHERE user_id = ? AND channel_id = ?
+        """
 
         # Connect to the database and execute the delete query
         with sqlite3.connect(DATABASE_PATH) as conn:
             cursor = conn.cursor()
-            cursor.executemany(delete_query, delete_params)
-            conn.commit()
+            if not pretend:
+                cursor.executemany(delete_query, delete_params)
+                conn.commit()
 
     except Exception as e:
-        logging.exception(f"An error occurred in kick_inactive_users() during the ban process: {e}")
+        logging.error(f"An error occurred in kick_inactive_users() during the ban process: {e}")
 
     final_message = f"Kicked {total_banned_count} users for inactivity."
 
