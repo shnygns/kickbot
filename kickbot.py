@@ -553,7 +553,7 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
 
         # Count the ban list, and announce to the group.
         count_of_users_to_ban = len(users_to_ban)
-        admin_message = START_PURGE + f" The KickBot is about to purge all users from {issuer_chat_name} who have not posted media in the last {readable_string_of_duration}."
+        admin_message = START_PURGE
         await context.bot.send_message(chat_id=issuer_chat_id, text=admin_message)
 
     except (IndexError, ValueError) as e:
