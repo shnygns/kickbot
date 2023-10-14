@@ -447,6 +447,8 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
     banned_count = 0
     for user_info in batch:
         user_id = user_info[0]
+        last_activity_str = user_info[1]
+        last_activity_readable = datetime.strptime(last_activity_str, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if last_activity_str else None
         rt = 0
         while rt < max_retries:
             try:
@@ -462,6 +464,8 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                 # Update the progress bar
                 pbar.update(1)    
                 logging.info(f"User ID {user_id} KICKED from {issuer_chat_id} '{issuer_chat_name}'.")
+                with open('kick.log', 'a') as log_file:
+                    log_file.write(f"User ID: {user_id}, Last Activity: {last_activity_readable}\n")
                 break
             except RetryAfter as e:
                 wait_seconds = e.retry_after
@@ -497,9 +501,11 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
 
     try:
         issuer_user_id = update.effective_user.id
+        issuer_user_name = update._effective_user.full_name
         issuer_chat_id = update.message.chat_id
         issuer_chat_name = update.effective_chat.title
         issuer_chat_type = update.effective_chat.type
+        pretend_str = "PRETEND " if pretend == True else ""
         admins = await update.effective_chat.get_administrators()
         admin_ids = {admin.user.id for admin in admins}
 
@@ -523,6 +529,10 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
             readable_string_of_duration = readable_string_of_duration[:-1]
 
         logging.warning(f"Requested duration is {readable_string_of_duration}. Cutoff date is {cutoff_date}.")
+        with open('kick.log', 'a') as log_file:
+                    log_file.write(f"\n\nA {pretend_str}kick has been started in {issuer_chat_name} ({issuer_chat_id}) at {datetime.utcnow().strftime('%d %B, %Y - %H:%M:%S')} UTC by {issuer_user_name}.\n")
+                    log_file.write(f"Requested duration is {readable_string_of_duration}. Cutoff date is {cutoff_date.strftime('%d %B, %Y - %H:%M:%S')}.\n\n")
+                    log_file.write(f"KICKED USERS:\n")
     except (IndexError, ValueError):
         await context.bot.send_message(chat_id=issuer_chat_id, text="Invalid command format. Use /inactivekick <time> (e.g., /inactivekick 1d).")
         logging.error(f"An error occurred in kick_inactive_users(), probably due to an invalid time argument.")
