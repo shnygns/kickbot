@@ -9,12 +9,15 @@ You can command this bot to eject from your group those who have not posted in a
 """
 
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import sqlite3
 import asyncio
 import pytz
 
 from config import (
     BOT_TOKEN,
+    API_ID,
+    API_HASH,
     DEBUG_CHATS,
     DEBUG_ADMIN_MESSAGE,
     DEBUG_CAPTURE_MESSAGE,
@@ -28,6 +31,15 @@ from config import (
 from datetime import datetime, timedelta
 from functools import wraps
 from tqdm import tqdm
+from telethon.sync import TelegramClient
+from telethon.tl.types import (
+    ChannelParticipantAdmin, 
+    ChannelParticipant, 
+    ChannelParticipantCreator,
+    ChatParticipant, 
+    ChatParticipantAdmin, 
+    ChatParticipantCreator
+)
 from telegram import Update, ChatMember
 from telegram.constants import ChatType
 from telegram.error import RetryAfter
@@ -42,11 +54,17 @@ from telegram.ext import (
 )
 
 # Configure logging
+when = 'midnight'  # Rotate logs at midnight (other options include 'H', 'D', 'W0' - 'W6', 'MIDNIGHT', or a custom time)
+interval = 1  # Rotate daily
+backup_count = 7  # Retain logs for 7 days
+log_handler = TimedRotatingFileHandler('app.log', when=when, interval=interval, backupCount=backup_count)
+log_handler.suffix = "%Y-%m-%d"  # Suffix for log files (e.g., 'my_log.log.2023-10-22')
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("app.log", mode="w"),
+        log_handler,
     ]
 )
 
@@ -63,6 +81,7 @@ max_retries = 3
 authorized_chats = set()
 utc_timezone = pytz.utc
 kick_started = False
+admin_participant_types = (ChannelParticipantAdmin, ChannelParticipantCreator, ChatParticipantAdmin, ChatParticipantCreator)
 
 # Initialize the SQLite database
 with sqlite3.connect(DATABASE_PATH) as conn:
@@ -75,6 +94,16 @@ with sqlite3.connect(DATABASE_PATH) as conn:
             user_id INTEGER,
             channel_id INTEGER,
             last_activity TIMESTAMP,
+            PRIMARY KEY (user_id, channel_id),
+            FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+        )
+    """
+    )
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS whitelist (
+            user_id INTEGER,
+            channel_id INTEGER,
             PRIMARY KEY (user_id, channel_id),
             FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
         )
@@ -217,13 +246,11 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not was_member and is_member:
         if not member.new_chat_member.status in ["administrator", "creator"]:
-            logging.info(f"User ID {user_id} '{user_name}' entered chat {chat_id} '{chat_name}'. Not admin. Capturing.")
             await capture_user(context, user_id, chat_id, user_name, chat_name)
         else:
             logging.info(f"User ID {user_id} '{user_name}' entered chat {chat_id} '{chat_name}'. Admin. Ignoring.")
     if (not is_member and was_member) and user_id != context.bot.id and not kick_started:
         if not member.new_chat_member.status in ["administrator", "creator"]:
-            logging.info(f"User ID {user_id} '{user_name}' (a non-admin) left the chat {chat_id} '{chat_name}'. Deleting.")
             delete_user(user_id, chat_id)
     return
 
@@ -241,7 +268,6 @@ async def handle_message(update: Update, context: CallbackContext):
             user_name = user.first_name + (" " + user.last_name if user.last_name else "")
 
             # No matter what the message contains, capture the sender in the DB 
-            logging.info(f"User ID {user_id} '{user_name}' activity in chat {chat_id} '{chat_name}'. Checking DB.")
             await capture_user(context, user_id, chat_id, user_name, chat_name)
 
             # If the message contained acceptable media, process further
@@ -257,8 +283,6 @@ async def handle_message(update: Update, context: CallbackContext):
                 else:
                     logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' contains acceptable media but is an admin. Ignoring.")
                     await debug_message(context, chat_id, user_name, DEBUG_ADMIN_MESSAGE)
-            else:
-                logging.info(f"User ID {user_id} '{user_name}' post in chat {chat_id} '{chat_name}' does NOT contain acceptable media. No activity update.")
             break
         except RetryAfter as e:
                 wait_seconds = e.retry_after
@@ -314,12 +338,10 @@ async def capture_user(context, user_id, chat_id, user_name, chat_name):
                     (user_id, chat_id),
                 )
                 conn.commit()
-                logging.warning(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' was just added to the database.")
                 await debug_message(context, chat_id, user_name, DEBUG_CAPTURE_MESSAGE)
             else:
                 # The combination already exists
                 conn.rollback()  # Roll back the transaction to discard the changes
-                logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' was already in the database and was ignored.")
     except Exception as e:
         logging.error(f"An error occurred in capture_user() checking a user against the db: {e}")
     return
@@ -426,7 +448,6 @@ async def clean_database(update, context):
 
             for chat_id in inactive_chats:
                 cursor.execute("DELETE FROM user_activity WHERE channel_id = ?", (chat_id,))
-                #print(f"EXECUTING - DELETE FROM user_activity WHERE channel_id = ?", (chat_id,))
             conn.commit()
 
             if len(inactive_chats)>0:
@@ -476,10 +497,80 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                     logging.warning(f"Max retry limit reached. Message not sent.")
                     raise e
             except Exception as e:
-                logging.error(f"An error occurred in kick_inactive_users() during the ban process: {e}")
-                break
+                logging.error(f"An error occurred in process_user_batch() during the kicking process: {e}")
+                raise e
 
     return banned_count
+
+
+async def assemble_banned_list(chat_id, admin_ids, cutoff_date) -> [tuple]:
+    users_to_ban = []
+    banned_name_lookup = {}
+    rt = 0
+    while rt < max_retries:
+        try:
+            logging.warning(f"STARTING DB QUERIES.")
+            with sqlite3.connect(DATABASE_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                # Get users who haven't posted media since the cutoff date or have never posted
+                cursor.execute(
+                    """
+                    SELECT user_id, last_activity FROM user_activity
+                    WHERE channel_id = ?
+                    """,
+                    (chat_id,),
+                )
+                user_data = cursor.fetchall()
+
+                # Convert user_data and admin_ids into sets for faster lookups
+                user_data_set = {entry['user_id'] for entry in user_data}
+
+            if API_ID and API_HASH:
+                    logging.warning(f"QUERYING ROOM MEMBERS.")
+                    telethon = await TelegramClient('memberlist_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+                    async for user in telethon.iter_participants(chat_id):
+                        user_id = user.id
+                        user_name = f"{user.first_name}{' ' + user.last_name if user.last_name else ''}"
+                        is_member = isinstance(user.participant, ChannelParticipant) or isinstance(user.participant, ChatParticipant)
+                        is_admin = True if any(isinstance(user.participant, cls) for cls in admin_participant_types) else False
+
+                        # Check if the user exists in the user_data set or has no last_activity
+                        if user_id in user_data_set:
+                            matching_entry = next(entry for entry in user_data if entry['user_id'] == user_id)
+                            last_activity = matching_entry['last_activity']
+                        else:
+                            last_activity = None
+
+                        # Convert last_activity to datetime if it's not None
+                        last_activity_datetime = datetime.strptime(last_activity, '%Y-%m-%d %H:%M:%S.%f') if last_activity else None
+
+                        # Check if the user's last_activity is before the cutoff_date or is None
+                        if (last_activity_datetime is None or last_activity_datetime < cutoff_date) and is_member:
+                            users_to_ban.append((user_id, last_activity))
+                            banned_name_lookup[user_id] = user_name
+                    await telethon.disconnect()    
+            else:
+                for user_id, last_activity in tqdm(user_data, desc="Assembling Banned List", unit=" user"):
+                    if user_id not in admin_ids:
+                        users_to_ban.append((user_id, last_activity)) 
+            return users_to_ban, banned_name_lookup
+        
+        except RetryAfter as e:
+                    wait_seconds = e.retry_after
+                    logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
+                    asyncio.sleep(wait_seconds)
+                    rt += 1
+                    if rt == max_retries:
+                        logging.warning(f"Max retry limit reached. Room member list not created.")
+                        raise e
+                
+        except Exception as e:
+                # Handle exceptions as needed
+                logging.exception(f"An error occurred while gathering users to ban: {e}")
+                raise e
+                
 
 # Function to kick inactive users
 async def kick_inactive_users(update: Update, context: CallbackContext, pretend=False):
@@ -513,7 +604,7 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
             await context.bot.send_message(chat_id=issuer_chat_id, text="You are not an admin in this channel.")
             return
 
-        logging.warning(f"\n\nHEADS UP! A valid inactivity purge has been started in {issuer_chat_name} ({issuer_chat_id})\n\n")
+        logging.warning(f"\n\nHEADS UP! A {pretend_str if pretend else 'LIVE '}inactivity purge has been started in {issuer_chat_name} ({issuer_chat_id})\n\n")
 
         time_span = context.args[0]
         unit = time_span[-1]
@@ -528,8 +619,8 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         if duration == 1:
             readable_string_of_duration = readable_string_of_duration[:-1]
 
-        logging.warning(f"Requested duration is {readable_string_of_duration}. Cutoff date is {cutoff_date}.")
-        with open('kick.log', 'a') as log_file:
+        logging.warning(f"Requested duration is {readable_string_of_duration}. Cutoff date is {cutoff_date}.\n")
+        with open('kick.log', 'w') as log_file:
                     log_file.write(f"\n\nA {pretend_str}kick has been started in {issuer_chat_name} ({issuer_chat_id}) at {datetime.utcnow().strftime('%d %B, %Y - %H:%M:%S')} UTC by {issuer_user_name}.\n")
                     log_file.write(f"Requested duration is {readable_string_of_duration}. Cutoff date is {cutoff_date.strftime('%d %B, %Y - %H:%M:%S')}.\n\n")
                     log_file.write(f"KICKED USERS:\n")
@@ -540,30 +631,11 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         return
     
     try:
-        logging.warning(f"STARTING DB QUERIES.")
-        with sqlite3.connect(DATABASE_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-
-            # Get users who haven't posted media since the cutoff date or have never posted
-            cursor.execute(
-                """
-                SELECT user_id, last_activity FROM user_activity
-                WHERE channel_id = ? AND (last_activity IS NULL OR last_activity < ?)
-                """,
-                (issuer_chat_id, cutoff_date),
-            )
-            user_data = cursor.fetchall()
-
-        # Filter out admins
-        users_to_ban = []
-        for user_id, last_activity in tqdm(user_data, desc="Filtering Users", unit=" user"):
-            if user_id not in admin_ids:
-                users_to_ban.append((user_id, last_activity))
-
+        await context.bot.send_message(chat_id=issuer_chat_id, text=START_PURGE)
+        users_to_ban, banned_name_lookup = await assemble_banned_list(issuer_chat_id, admin_ids, cutoff_date)
         # Count the ban list, and announce to the group.
         count_of_users_to_ban = len(users_to_ban)
-        admin_message = START_PURGE
+        admin_message = f" The KickBot is about to purge {count_of_users_to_ban} users from {issuer_chat_name} who have not posted media in the last {readable_string_of_duration}."
         await context.bot.send_message(chat_id=issuer_chat_id, text=admin_message)
 
     except (IndexError, ValueError) as e:
@@ -573,10 +645,11 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
     
     # Define a shared variable to keep track of the total banned count
     total_banned_count = 0
-    pbar = tqdm(total=len(users_to_ban), desc="Kicking Users", unit=" user")
-    # Kick the inactive users and count the number of users kicked
+    pbar = tqdm(total=len(users_to_ban), desc="KICKBOT: Kicking Users", unit=" user")
+
+    # Split the lust of users to ban into sub-lists for asynchronous processing
     try:
-        # Calculate the number of sub-lists based on a maximum batch size (e.g., 1000 users per batch)
+        # Calculate the number of sub-lists based on set number of lists
         num_lists = NUM_BATCHES  # Specify the number of lists in the config.py file
         total_users = len(users_to_ban)  # Get the total number of users
         batch_size = max(1, total_users // num_lists)  # Calculate the batch size
@@ -624,8 +697,15 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         logging.error(f"An error occurred in kick_inactive_users() during the ban process: {e}")
 
     final_message = f"Kicked {total_banned_count} users for inactivity."
-
     await context.bot.send_message(chat_id=issuer_chat_id, text=final_message)
+
+    # If the kick happened in the debug chat, report out the users who were kicked.
+    if issuer_chat_id in DEBUG_CHATS and API_ID and API_HASH:
+        text = "DEBUG: KICKED USERS:\n\n"
+        for user in users_to_ban:
+            text = text + f"{banned_name_lookup[user[0]]} - Last activity: {user[1]}\n"
+        await context.bot.send_message(chat_id=issuer_chat_id, text=text)
+
     kick_started = False
     return
 

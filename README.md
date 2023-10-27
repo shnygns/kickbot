@@ -116,6 +116,18 @@ To run your Telegram bot, you'll need a Bot Token from the Telegram BotFather. F
 
 5. In the `config.py` file, set the `BOT_TOKEN` variable to your Bot Token.
 
+
+## IMPORTANT - Improve Accuracy with a Telegram user API ID and HASH
+
+Kickbot will try to watch for usrs coming and going from your group, but that method does not produce a 100% accurate list of chat members. For better accuracy, we STRONGLY recommend getting an API ID and HASH from my.telegram.com. This info gives you access to a more advanced API that will deliver a list of participants in your chat, leading to better kicking accuracy. 
+
+
+In config.py:
+
+API_ID = XXXXXXXXXX      # Integer (i.e. no quotes)
+API_HASH = "XXXXXXXXXX"  # String (i.e. with quotes)
+
+
 ## Usage
 
 Invite this bot to your group as an admin. Make sure the bot's settings in Bot Father give it full privilidges. The bot will store user information in its database as people interact in your group.
@@ -133,6 +145,9 @@ Here are some of the commands you can use:
 /inactivekick (time) - Kick inactive users who haven't posted media in the specified time.
 
 /pretendkick (time) - Simulate kicking inactive users without actually kicking them.
+
+/cleandb - Cleans inactive chats from the DB (works only in private chat with bot).
+
 
 For example, the command /inactivekick 1d would kick all who have not posted in the last day, or who have never posted.
 

@@ -2,7 +2,7 @@ config.py
 check-sql.py
 __pycache__
 *.db
-*.log
+*.log*
 *.session
 .vscode
 milestone*

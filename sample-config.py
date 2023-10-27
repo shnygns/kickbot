@@ -5,11 +5,22 @@ CONFIG.PY
 This file stores all Telegram API session information and config settings.
 """
 
-""" CREDENTIALS """
+""" BASIC CREDENTIALS """
+# BASIC CREDENTIALS - BOT TOKEN
+# Gotten from Telegram BotFather
 BOT_TOKEN = ""
 
-""" SETTINGS """
 
+""" ADVANCED ACCURACY """
+# Kickbot will try to watch for usrs coming and going from your group, but that method does not produce a 100% accurate list of chat members.
+# For better accuracy, we STRONGLY recommend getting an API ID and HASH from my.telegram.org.
+# This info gives you access to a more advanced API that will deliver a list of participants in your chat, leading to better kicking accuracy. 
+# API_ID is an integer (no quotes). API_HASH is a string (quotes).
+API_ID = 
+API_HASH = ""
+
+
+""" SETTINGS """
 # If this list is empty, your bot may be used by anyone who is an admin in a chat where the bot is operating. You can fill this 
 # list with authorized User IDs (separated by commas, no quotes) that are acceptable for use. 
 # Only those users listed will be able to command the bot, and the bot will only work in rooms where someone on the list is an admin.
