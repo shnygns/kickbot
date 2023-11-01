@@ -497,7 +497,7 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                     logging.warning(f"Max retry limit reached. Error: {e}. Kick batch not completely processed.")
                     raise e
             except Exception as e:
-                logging.warning(f"Got a timeout error. Waiting for 5 seconds...")
+                logging.warning(f"Got an error while processing: {e}. Retrying in 5 seconds...")
                 asyncio.sleep(5)
                 rt += 1
                 if rt == max_retries:
