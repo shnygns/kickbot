@@ -494,12 +494,15 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                 asyncio.sleep(wait_seconds)
                 rt += 1
                 if rt == max_retries:
-                    logging.warning(f"Max retry limit reached. Message not sent.")
+                    logging.warning(f"Max retry limit reached. Error: {e}. Kick batch not completely processed.")
                     raise e
             except Exception as e:
-                logging.error(f"An error occurred in process_user_batch() during the kicking process: {e}")
-                raise e
-
+                logging.warning(f"Got a timeout error. Waiting for 5 seconds...")
+                asyncio.sleep(5)
+                rt += 1
+                if rt == max_retries:
+                    logging.warning(f"Max retry limit reached. Error: {e}. Kick batch not completely processed.")
+                    raise e
     return banned_count
 
 
@@ -575,6 +578,10 @@ async def assemble_banned_list(chat_id, admin_ids, cutoff_date) -> [tuple]:
 # Function to kick inactive users
 async def kick_inactive_users(update: Update, context: CallbackContext, pretend=False):
     global kick_started
+
+    if not update.message or kick_started == True:
+        return
+
     kick_started = True
 # Define a mapping of units to timedelta arguments
     unit_to_timedelta = {
@@ -586,9 +593,6 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         'M': 'months',
         'y': 'years',
     }
-
-    if not update.message:
-        return
 
     try:
         issuer_user_id = update.effective_user.id
