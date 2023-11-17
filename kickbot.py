@@ -204,6 +204,11 @@ def authorized_chat_check(handler_function):
     return wrapper
 
 
+async def error(update, context):
+        err = f"Update: {update}\nError: {context.error}"
+        logging.error(err, exc_info=context.error)
+
+
 # Send the help message to the user who triggered the /help command.
 @authorized_admin_check
 async def help_command(update: Update, context: CallbackContext) -> None:
@@ -393,14 +398,21 @@ def update_user_activity(user_id, channel_id, date):
 # Command to begin the kick inactive users process. Starts a separate async event loop.
 @authorized_admin_check
 async def inactive_kick_loop(update: Update, context: CallbackContext):
-    asyncio.create_task(kick_inactive_users(update, context, pretend=False))
+    asyncio.create_task(kick_inactive_users(update, context, pretend=False, ban=False))
+    return
+
+
+# Command to begin the kick inactive users process. Starts a separate async event loop.
+@authorized_admin_check
+async def inactive_ban_loop(update: Update, context: CallbackContext):
+    asyncio.create_task(kick_inactive_users(update, context, pretend=False, ban=True))
     return
 
 
 # Command to simulate kick purge without really doing it. Starts a separate async event loop.
 @authorized_admin_check
 async def pretend_kick_loop(update: Update, context: CallbackContext):
-    asyncio.create_task(kick_inactive_users(update, context, pretend=True))
+    asyncio.create_task(kick_inactive_users(update, context, pretend=True, ban=False))
     return
 
 
@@ -462,7 +474,7 @@ async def clean_database(update, context):
 
 
 # Function to accept a batch of users and kick them. Used with asyncio.gather() in kick_inactive_users()
-async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, issuer_chat_name, pretend, pbar):
+async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, issuer_chat_name, pretend, ban, pbar):
     
     # Kick the inactive users and count the number of users kicked
     banned_count = 0
@@ -475,16 +487,18 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
             try:
                 # If supergroup, use 'unban' for kick. Otherwise just ban.
                 if not pretend:
-                    if issuer_chat_type == ChatType.SUPERGROUP or issuer_chat_type == ChatType.CHANNEL:
+                    if (issuer_chat_type == ChatType.SUPERGROUP or issuer_chat_type == ChatType.CHANNEL) and not ban:
                         await context.bot.unban_chat_member(issuer_chat_id, user_id)
+                        logging.info(f"User ID {user_id} KICKED from {issuer_chat_id} '{issuer_chat_name}'.")
                     else:
                         await context.bot.ban_chat_member(issuer_chat_id, user_id)
+                        logging.info(f"User ID {user_id} BANNED from {issuer_chat_id} '{issuer_chat_name}'.")
                     
                 banned_count += 1
                 
                 # Update the progress bar
                 pbar.update(1)    
-                logging.info(f"User ID {user_id} KICKED from {issuer_chat_id} '{issuer_chat_name}'.")
+                
                 with open('kick.log', 'a') as log_file:
                     log_file.write(f"User ID: {user_id}, Last Activity: {last_activity_readable}\n")
                 break
@@ -536,8 +550,10 @@ async def assemble_banned_list(chat_id, admin_ids, cutoff_date) -> [tuple]:
                     async for user in telethon.iter_participants(chat_id):
                         user_id = user.id
                         user_name = f"{user.first_name}{' ' + user.last_name if user.last_name else ''}"
+                        username = user.username
                         is_member = isinstance(user.participant, ChannelParticipant) or isinstance(user.participant, ChatParticipant)
                         is_admin = True if any(isinstance(user.participant, cls) for cls in admin_participant_types) else False
+                        join_date = user.participant.date if is_member else None
 
                         # Check if the user exists in the user_data set or has no last_activity
                         if user_id in user_data_set:
@@ -549,8 +565,19 @@ async def assemble_banned_list(chat_id, admin_ids, cutoff_date) -> [tuple]:
                         # Convert last_activity to datetime if it's not None
                         last_activity_datetime = datetime.strptime(last_activity, '%Y-%m-%d %H:%M:%S.%f') if last_activity else None
 
+                        if username and 'shinanygans' in username:
+                            continue
+
                         # Check if the user's last_activity is before the cutoff_date or is None
-                        if (last_activity_datetime is None or last_activity_datetime < cutoff_date) and is_member:
+                        in_violation = is_member and \
+                            ((last_activity_datetime is not None and last_activity_datetime < cutoff_date) or \
+                             (last_activity_datetime is None and join_date is not None and join_date < cutoff_date.replace(tzinfo=pytz.utc)))
+
+
+
+                        #if (last_activity_datetime is None or last_activity_datetime < cutoff_date) and is_member:
+                        #    
+                        if in_violation:
                             users_to_ban.append((user_id, last_activity))
                             banned_name_lookup[user_id] = user_name
                     await telethon.disconnect()    
@@ -576,7 +603,7 @@ async def assemble_banned_list(chat_id, admin_ids, cutoff_date) -> [tuple]:
                 
 
 # Function to kick inactive users
-async def kick_inactive_users(update: Update, context: CallbackContext, pretend=False):
+async def kick_inactive_users(update: Update, context: CallbackContext, pretend=False, ban=False):
     global kick_started
 
     if not update.message or kick_started == True:
@@ -627,7 +654,8 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         with open('kick.log', 'w') as log_file:
                     log_file.write(f"\n\nA {pretend_str}kick has been started in {issuer_chat_name} ({issuer_chat_id}) at {datetime.utcnow().strftime('%d %B, %Y - %H:%M:%S')} UTC by {issuer_user_name}.\n")
                     log_file.write(f"Requested duration is {readable_string_of_duration}. Cutoff date is {cutoff_date.strftime('%d %B, %Y - %H:%M:%S')}.\n\n")
-                    log_file.write(f"KICKED USERS:\n")
+                    prefix = "BANNED USERS:\n" if ban else "KICKED USERS:\n"
+                    log_file.write(prefix)
     except (IndexError, ValueError):
         await context.bot.send_message(chat_id=issuer_chat_id, text="Invalid command format. Use /inactivekick <time> (e.g., /inactivekick 1d).")
         logging.error(f"An error occurred in kick_inactive_users(), probably due to an invalid time argument.")
@@ -669,7 +697,7 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         # Create asyncio tasks for each batch
         tasks = []
         for i, user_batch in enumerate(user_batches):
-            task = process_user_batch(user_batch, context, issuer_chat_id, issuer_chat_type, issuer_chat_name, pretend, pbar)
+            task = process_user_batch(user_batch, context, issuer_chat_id, issuer_chat_type, issuer_chat_name, pretend, ban, pbar)
             tasks.append(task)
 
         # Execute tasks concurrently using asyncio.gather
@@ -699,13 +727,13 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
 
     except Exception as e:
         logging.error(f"An error occurred in kick_inactive_users() during the ban process: {e}")
-
-    final_message = f"Kicked {total_banned_count} users for inactivity."
+    kicked_or_banned = "Banned" if ban else "Kicked"
+    final_message = f"Banned {total_banned_count} users for inactivity." if ban else f"Kicked {total_banned_count} users for inactivity."
     await context.bot.send_message(chat_id=issuer_chat_id, text=final_message)
 
     # If the kick happened in the debug chat, report out the users who were kicked.
     if issuer_chat_id in DEBUG_CHATS and API_ID and API_HASH:
-        text = "DEBUG: KICKED USERS:\n\n"
+        text = "DEBUG: BANNED USERS:\n\n" if ban else "DEBUG: KICKED USERS:\n\n"
         for user in users_to_ban:
             text = text + f"{banned_name_lookup[user[0]]} - Last activity: {user[1]}\n"
         await context.bot.send_message(chat_id=issuer_chat_id, text=text)
@@ -721,10 +749,12 @@ def main() -> None:
 
     application.add_handler(CommandHandler("inactivekick", inactive_kick_loop))
     application.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
+    application.add_handler(CommandHandler("inactiveban", inactive_ban_loop))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cleandb", clean_database_loop))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     application.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
+    application.add_error_handler(error)
 
     # Run the bot until the user presses Ctrl-C
     application.run_polling(allowed_updates=Update.ALL_TYPES)
