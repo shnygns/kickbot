@@ -138,20 +138,30 @@ When a group admin issues the /inactivekick <time> command (like "/inactivekick 
 
 They will be kicked from the group, and you will be given a summary of the number of people kicked. If you kick fewer than 10 users, you will see them named individually.
 
-Here are some of the commands you can use:
+Be sure to /start a private chat with the bot to receive messages and info. Here are some of the commands you can use:
 
+KICK COMMANDS
+/inactivekick (time) - Kick those who haven't posted files/media
+/inactiveban (time) - Ban those who haven't posted files/media
+
+LOOKUPS
+/gcstats (time) - Shows # of posters vs lurkers in chat.
+/lurkinfo (id or @) - Look up user info in the kicked user db.
+
+WHITELIST
+/wl - Show whitelist for current chat.
+/wl_add (id or @) - Add user to whitelist.
+/wl_del (id or @) - Remove user to whitelist.
+
+OTHER
+/3strikes - Turn on/off 3 strikes mode (2+ past kicks = ban).
+/cleandb - Cleans inactive chats from the DB (works only in private chat with bot).
 /help - Show this help message.
 
-/inactivekick (time) - Kick inactive users who haven't posted media in the specified time.
+(time) units use (s)econds, (m)inutes, (h)ours, (d)ays, (M)onths, or (y)ears.\n" 
 
-/pretendkick (time) - Simulate kicking inactive users without actually kicking them.
+For example, the command /inactivekick 1d would kick all who have not posted in the last day, or who have never posted."
 
-/cleandb - Cleans inactive chats from the DB (works only in private chat with bot).
-
-
-For example, the command /inactivekick 1d would kick all who have not posted in the last day, or who have never posted.
-
-(Time) units use (s)econds, (m)inutes, (h)ours, (d)ays, (M)onths, or (y)ears.
 
 
 ## Configuration and Features

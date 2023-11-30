@@ -3,7 +3,7 @@ check-sql.py
 __pycache__
 *.db
 *.log*
-*.session
+*.session*
 .vscode
 milestone*
 test*
