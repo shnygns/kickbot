@@ -19,6 +19,8 @@ rsa = "==4.9"
 sniffio = "==1.3.0"
 telethon = "==1.30.3"
 tqdm = "==4.66.1"
+aioschedule = "*"
+tabulate = "*"
 
 [dev-packages]
 

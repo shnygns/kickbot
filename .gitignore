@@ -1,5 +1,5 @@
 config.py
-check-sql.py
+*sql*.py
 __pycache__
 *.db
 *.log*
@@ -9,3 +9,4 @@ milestone*
 test*
 preview*
 client*
+*.csv
