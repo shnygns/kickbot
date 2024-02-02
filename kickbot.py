@@ -457,7 +457,7 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
             user_id = participant.id
             member_record_dict = lookup_group_member(user_id, chat_id)
             member_record_dict = member_record_dict[0] if len(member_record_dict) > 0 else None
-            member_previous_status[user_id] = member_record_dict.get('status')
+            member_previous_status[user_id] = member_record_dict.get('status') if member_record_dict else 'N/A'
             if not hasattr(participant, 'participant'):
                 user_status = 'Not Available'
             elif isinstance(participant.participant, ChannelParticipantAdmin):
