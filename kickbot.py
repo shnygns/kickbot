@@ -452,10 +452,12 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
         # Step 3: Iterate through the participants returned by iter_participants
         logging.warning(f"Cataloging members of {chat_id}")
         batch_insert_parameters = []
+        member_previous_status = {}
         async for participant in telethon.iter_participants(chat_id):
             user_id = participant.id
             member_record_dict = lookup_group_member(user_id, chat_id)
             member_record_dict = member_record_dict[0] if len(member_record_dict) > 0 else None
+            member_previous_status[user_id] = member_record_dict.get('status')
             if not hasattr(participant, 'participant'):
                 user_status = 'Not Available'
             elif isinstance(participant.participant, ChannelParticipantAdmin):
@@ -552,7 +554,7 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
                 #joined_username = joined_member.username if joined_member.username else None
                 logging.warning(f"SCAN: {chat_id} -- {joined_user_name} - {joined_member.username}"
                                 f"{' -ADMIN' if joined_user_id in AUTHORIZED_ADMINS or joined_user_id in admin_ids else ''} "
-                                f"joining {chat.title}. Prior Status: {member_record_dict.get(user_id) if member_record_dict and member_record_dict.get(user_id) else 'N/A'} - New Status: {participant_dict[joined_user_id]} "
+                                f"joining {chat.title}. Prior Status: {member_previous_status.get(joined_user_id) if member_previous_status else 'N/A'} - New Status: {participant_dict[joined_user_id]} "
                                 f"{'(OBLIGATION: '+ obligation_chat.title + ')' if obligation_chat else ''}"
                                 )
                 #if obligation_chat_id:
