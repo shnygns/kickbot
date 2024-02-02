@@ -1794,15 +1794,16 @@ async def handle_message(update: Update, context: CallbackContext):
             if update.effective_message.document or update.effective_message.photo or update.effective_message.video:
                 date = update.effective_message.date
                 chat_member = await context.bot.get_chat_member(chat_id, user_id)
+                async for participant in telethon.iter_participants(chat_id, search=user.first_name):
+                    if participant.id == user_id:
+                        update_or_insert_chat_member(participant, chat_id, "last_posted", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
 
                 # If the sender was not an admin, update the last_activity in the database
                 if not chat_member.status in ["administrator", "creator"]:
                     logging.warning(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' *POSTED MEDIA*")
                     await debug_message(context, chat_id, user_name, DEBUG_UPDATE_MESSAGE)
                     update_user_activity(user_id, chat_id, date)
-                    async for participant in telethon.iter_participants(chat_id, search=user.first_name):
-                        if participant.id == user_id:
-                            update_or_insert_chat_member(participant, chat_id, "last_posted", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
+
                 else:
                     logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' contains acceptable media but is an admin. Ignoring.")
                     await debug_message(context, chat_id, user_name, DEBUG_ADMIN_MESSAGE)
