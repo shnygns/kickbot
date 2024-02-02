@@ -1031,7 +1031,17 @@ def update_or_insert_chat_member(telethon_chat_member, chat_id, field=None, valu
         )
         row = cursor.fetchone()
 
-        if not row:
+        if not row and status:
+            insert_chat_member(telethon_chat_member, chat_id)
+            cursor.execute(
+            f"""
+            UPDATE group_member
+            SET status = ?
+            WHERE user_id = ? AND chat_id = ?
+            """,
+            (user_status, user_id, chat_id),
+        )               
+        elif not row:
             insert_chat_member(telethon_chat_member, chat_id)
         elif field is None:
             cursor.execute(
