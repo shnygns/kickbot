@@ -803,7 +803,7 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
                     for joined_user_id in results_joined_user_ids:
                         if joined_user_id not in AUTHORIZED_ADMINS and joined_user_id not in admins and joined_user_id not in shin_ids:
                             lookup = lookup_active_group_member(joined_user_id, obligation_chat_id)
-                            logging.warning(f"SCAN: **ALT LOOKUP** Joining user {joined_user_id} {'DOES' if len(lookup)>0 else 'DOES NOT'} appear in our interbal DB for obligation chat {obligation_chat_id}")
+                            logging.warning(f"SCAN: **ALT LOOKUP** Joining user {joined_user_id} {'DOES' if len(lookup)>0 else 'DOES NOT'} appear in our internal DB for obligation chat {obligation_chat_id}")
                             if len(lookup)==0:
                                 obligation_chat = await telethon.get_entity(obligation_chat_id)
                                 joined_user = await telethon.get_entity(joined_user_id)
@@ -1087,8 +1087,11 @@ async def ban_from_blacklist(update: Update, context: CallbackContext):
             blacklisted_uids = []
             for blacklisted_user in blacklist:
                 uid = blacklisted_user[0]
-                await context.bot.ban_chat_member(chat_id, uid)
-                blacklisted_uids.append(uid)
+                try:
+                    await context.bot.ban_chat_member(chat_id, uid)
+                    blacklisted_uids.append(uid)
+                except Exception as e:
+                    logging.warning(f"Could not ban {uid} from {chat_id} - Ban error or deleted account.")
                 insert_kicked_user_in_blacklist(uid, chat_id)
             batch_update_banned(blacklisted_uids, chat_id)
             logging.warning(f"BANNING BLACKLIST FROM {chat_name} COMPLETE. BANNED {len(blacklisted_uids)} USERS.")
