@@ -1179,59 +1179,62 @@ async def lookup(update: Update, context: CallbackContext):
             kicked_user_message+=f"IS SCAM: {kicked_user_is_scam}\n"
             kicked_user_message+=f"RESTRICTED: {kicked_user_is_restricted}\n"
             kicked_user_message+=f"{'RESTR REASON: ' if kicked_user_is_restricted else ''}{kicked_user_restriction_reason}\n\n"
-            await context.bot.send_message(chat_id=issuer_user_id, text=kicked_user_message)
+        await context.bot.send_message(chat_id=issuer_user_id, text=kicked_user_message)
 
-            for group_member_row in group_member_dict:
-                kicked_user_chat_id = group_member_row['chat_id']
-                chat = await telethon.get_entity(kicked_user_chat_id)
-                chat_name = chat.title
-                kicked_user_row = next((row for row in kicked_user_data if row[1] == chat_id), None)
-                blacklist_row = next((row for row in blacklist_data if row[1] == chat_id), None)
+        for group_member_row in group_member_dict:
+            kicked_user_chat_id = group_member_row['chat_id']
+            chat = await telethon.get_entity(kicked_user_chat_id)
+            chat_name = chat.title
+            kicked_user_row = next((row for row in kicked_user_data if row[1] == chat_id), None)
+            blacklist_row = next((row for row in blacklist_data if row[1] == chat_id), None)
 
-                kicked_user_number_kicks = kicked_user_row[2] if kicked_user_row else None
-                if kicked_user_row and kicked_user_row[3]:
-                    kicked_user_last_posted = datetime.strptime(kicked_user_data[3], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S')
-                else:
-                    kicked_user_last_posted = "Never"
-                kicked_user_last_kicked = datetime.strptime(kicked_user_row[4], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if kicked_user_row else None
-                
+            kicked_user_number_kicks = kicked_user_row[2] if kicked_user_row else None
+            if kicked_user_row and kicked_user_row[3]:
+                kicked_user_last_posted = datetime.strptime(kicked_user_data[3], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S')
+            else:
+                kicked_user_last_posted = "Never"
+            kicked_user_last_kicked = datetime.strptime(kicked_user_row[4], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if kicked_user_row else None
+            try:
                 chat_member = await context.bot.get_chat_member(kicked_user_chat_id, kicked_user_id)
-                kicked_user_status = None
-                
-                if chat_member:
-                    if chat_member.status == ChatMember.ADMINISTRATOR:
-                        kicked_user_status = "Admin"
-                    elif chat_member.status == ChatMember.BANNED:
-                        kicked_user_status = "Banned"
-                    elif chat_member.status == ChatMember.LEFT:
-                        kicked_user_status = group_member_row['status'] if group_member_row['status'] else "Left"
-                    elif chat_member.status == ChatMember.MEMBER:
-                        kicked_user_status = "Member"
-                    elif chat_member.status == ChatMember.OWNER:
-                        kicked_user_status = "Owner"
-                    elif chat_member.status == ChatMember.RESTRICTED:
-                        kicked_user_status = "Restricted"
-                    else:
-                        kicked_user_status = "None"
-                else:
-                        kicked_user_status = "None"
+            except BadRequestError as e:
+                logging.warning(f"Bad request error in lookup: {e}")
 
-                # Search for the user in the list of participants
-                kicked_user_last_joined = datetime.strptime(group_member_row['last_joined'], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if group_member_row else 'N/A'
-                #kicked_user_last_joined = None
-                #async for participant in telethon.iter_participants(kicked_user_chat_id, search=kicked_user.first_name):
-                #    if participant.id == kicked_user_id:
-                #        kicked_user_last_joined = participant.participant.date.strftime('%d %B, %Y - %H:%M:%S') if chat_member.status == ChatMember.MEMBER else None
-                #        break
-                kicked_chat_message=""
-                kicked_chat_message+=f"{kicked_user_name} - {chat_name}{' - BLACKLISTED' if blacklist_row else ''}\n"
-                kicked_chat_message+=f"KICKS from {chat_name}: {kicked_user_number_kicks}\n"
-                kicked_chat_message+=f"BANS from {chat_name}: {group_member_row['times_banned'] if group_member_row['times_banned'] else 'N/A'}\n"
-                kicked_chat_message+=f"MOST RECENTLY JOINED: {kicked_user_last_joined if kicked_user_last_joined else 'N/A'}\n"
-                kicked_chat_message+=f"LAST POST: {kicked_user_last_posted}\n"
-                kicked_chat_message+=f"LAST KICKED: {kicked_user_last_kicked}\n"
-                kicked_chat_message+=f"STATUS: {kicked_user_status}\n\n"
-                await context.bot.send_message(chat_id=issuer_user_id, text=kicked_chat_message)
+            kicked_user_status = None
+            
+            if chat_member:
+                if chat_member.status == ChatMember.ADMINISTRATOR:
+                    kicked_user_status = "Admin"
+                elif chat_member.status == ChatMember.BANNED:
+                    kicked_user_status = "Banned"
+                elif chat_member.status == ChatMember.LEFT:
+                    kicked_user_status = group_member_row['status'] if group_member_row['status'] else "Left"
+                elif chat_member.status == ChatMember.MEMBER:
+                    kicked_user_status = "Member"
+                elif chat_member.status == ChatMember.OWNER:
+                    kicked_user_status = "Owner"
+                elif chat_member.status == ChatMember.RESTRICTED:
+                    kicked_user_status = "Restricted"
+                else:
+                    kicked_user_status = "None"
+            else:
+                    kicked_user_status = "None"
+
+            # Search for the user in the list of participants
+            kicked_user_last_joined = datetime.strptime(group_member_row['last_joined'], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if group_member_row else 'N/A'
+            #kicked_user_last_joined = None
+            #async for participant in telethon.iter_participants(kicked_user_chat_id, search=kicked_user.first_name):
+            #    if participant.id == kicked_user_id:
+            #        kicked_user_last_joined = participant.participant.date.strftime('%d %B, %Y - %H:%M:%S') if chat_member.status == ChatMember.MEMBER else None
+            #        break
+            kicked_chat_message=""
+            kicked_chat_message+=f"{kicked_user_name} - {chat_name}{' - BLACKLISTED' if blacklist_row else ''}\n"
+            kicked_chat_message+=f"KICKS from {chat_name}: {kicked_user_number_kicks}\n"
+            kicked_chat_message+=f"BANS from {chat_name}: {group_member_row['times_banned'] if group_member_row['times_banned'] else 'N/A'}\n"
+            kicked_chat_message+=f"MOST RECENTLY JOINED: {kicked_user_last_joined if kicked_user_last_joined else 'N/A'}\n"
+            kicked_chat_message+=f"LAST POST: {kicked_user_last_posted}\n"
+            kicked_chat_message+=f"LAST KICKED: {kicked_user_last_kicked}\n"
+            kicked_chat_message+=f"STATUS: {kicked_user_status}\n\n"
+            await context.bot.send_message(chat_id=issuer_user_id, text=kicked_chat_message)
    
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
