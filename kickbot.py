@@ -1814,6 +1814,9 @@ async def handle_message(update: Update, context: CallbackContext):
         except Forbidden as e:
             logging.warning(f"{e}")
 
+        except ChannelPrivateError as e:
+            logging.warning(f"PRIVATE ERROR - May no longer be active")
+
         except TimeoutError as e:
             logging.warning(f"{e}")
 
