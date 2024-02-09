@@ -1,5 +1,6 @@
 import sqlite3
 import pytz
+import csv
 import logging
 from datetime import datetime, timedelta
 from config import DATABASE_PATH
@@ -63,9 +64,11 @@ def initialize_db():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS authorized_chats (
                 chat_id INTEGER PRIMARY KEY,
+                chat_name STRING,
                 three_strikes_mode BOOLEAN DEFAULT FALSE,
                 ban_leavers_mode BOOLEAN DEFAULT FALSE,
-                obligation_chat INTEGER
+                obligation_chat INTEGER,
+                last_scan TIMESTAMP
             )
         """
         )
@@ -79,6 +82,12 @@ def initialize_db():
         if 'obligation_chat' not in columns:
             # If the column doesn't exist, add it to the table
             cursor.execute(f"ALTER TABLE authorized_chats ADD COLUMN obligation_chat INTEGER")
+        if 'last_scan' not in columns:
+            # If the column doesn't exist, add it to the table
+            cursor.execute(f"ALTER TABLE authorized_chats ADD COLUMN last_scan TIMESTAMP")
+        if 'chat_name' not in columns:
+            # If the column doesn't exist, add it to the table
+            cursor.execute(f"ALTER TABLE authorized_chats ADD COLUMN chat_name STRING")
 
 
         # Create the index on user_id and channel_id
@@ -158,22 +167,26 @@ def initialize_db():
 
 # ********* CHAT AUTHORIZATION COMMANDS *********
 
-def is_chat_authorized(chat_id):
+def is_chat_authorized(chat_id, chat_name):
     try:
         with sqlite3.connect(DATABASE_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM authorized_chats WHERE chat_id = ?", (chat_id,))
-            return cursor.fetchone() is not None
+            cursor.execute("SELECT chat_name FROM authorized_chats WHERE chat_id = ?", (chat_id,))
+            response = cursor.fetchone()
+            if chat_name and response and chat_name not in response:
+                cursor.execute("UPDATE authorized_chats SET chat_name = ? WHERE chat_id = ?", (chat_name, chat_id))
+                conn.commit()
+            return response is not None
     except Exception as e:
         print(f"Error checking if chat is authorized: {e}")
         return False
     
 
-def insert_authorized_chat(chat_id):
+def insert_authorized_chat(chat_id, chat_name):
     try:
         with sqlite3.connect(DATABASE_PATH) as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO authorized_chats (chat_id) VALUES (?)", (chat_id,))
+            cursor.execute("INSERT INTO authorized_chats (chat_id, chat_name) VALUES (?, ?)", (chat_id, chat_name))
             conn.commit()
     except Exception as e:
         print(f"Error inserting authorized chat: {e}")
@@ -190,6 +203,20 @@ def delete_authorized_chat(chat_id):
         print(f"Error deleting authorized chat: {e}")
     return
 
+def get_chat_ids_and_names():
+    try:
+        chat_info = {}
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT chat_id, chat_name FROM authorized_chats")
+            rows = cursor.fetchall()
+            for row in rows:
+                chat_id, chat_name = row
+                chat_info[chat_id] = chat_name
+        return chat_info
+    except Exception as e:
+        print(f"Error fetching chat IDs and names: {e}")
+        return {}
 
 
 # ********* USER ACTIVITY COMMANDS *********
@@ -649,6 +676,19 @@ def list_member_ids_in_db(chat_id):
     return user_ids
 
 
+def list_unkonwn_status_in_db(chat_id):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT user_id FROM group_member
+            WHERE chat_id = ? AND (status = 'Not Available')
+        ''', (chat_id,))
+
+        user_ids = [row[0] for row in cursor.fetchall()]
+
+    return user_ids
+
+
 def list_kicked_users_in_db(chat_id):
     with sqlite3.connect(DATABASE_PATH) as conn:
         cursor = conn.cursor()
@@ -960,6 +1000,25 @@ def update_or_insert_chat_member(telethon_chat_member, chat_id, field=None, valu
     user_id = telethon_chat_member.id
     with sqlite3.connect(DATABASE_PATH) as conn:
         cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT first_joined, last_joined FROM group_member
+            WHERE user_id = {user_id} AND chat_id = {chat_id}
+            LIMIT 1
+            """
+        )
+        row=cursor.fetchone()
+        preexisting_last_joined_date = None
+        if row:
+            if row[1]:
+                 preexisting_last_joined_date = row[1]
+            elif row[0]:
+                 preexisting_last_joined_date = row[0]
+                
+        if hasattr(telethon_chat_member, 'participant') and hasattr(telethon_chat_member.participant, 'date'):
+            last_joined = telethon_chat_member.participant.date
+        else:
+            last_joined = preexisting_last_joined_date
 
         if field == "last_posted":
             additional_query_string = (
@@ -985,41 +1044,45 @@ def update_or_insert_chat_member(telethon_chat_member, chat_id, field=None, valu
                 , times_kicked = COALESCE((SELECT times_kicked FROM group_member WHERE user_id = {user_id} AND chat_id = {chat_id}) + 1, 1)
                 """
             )
-        last_joined = None
+        # last_joined = None
         if field == 'last_left':
             user_status = 'Left'
         elif field == 'last_banned':
             user_status = 'Banned'
         elif field == 'last_kicked':
             user_status = 'Kicked'
+        elif status=='Member':
+            user_status=status
+            last_joined = datetime.utcnow()
         elif status:
             user_status=status
         elif not hasattr(telethon_chat_member, 'participant'):
             user_status = 'Not Available'
         elif isinstance(telethon_chat_member.participant, ChannelParticipantAdmin):
             user_status = 'Admin'
-            last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
+           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
         elif isinstance(telethon_chat_member.participant, ChannelParticipantCreator):
             user_status = 'Creator'
-            last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
+           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
         elif isinstance(telethon_chat_member.participant, ChannelParticipant):
             user_status = 'Member'
-            last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
+           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
         elif isinstance(telethon_chat_member.participant, ChatParticipantAdmin):
             user_status = 'Admin'
-            last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
+           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
         elif isinstance(telethon_chat_member.participant, ChatParticipantCreator):
             user_status = 'Creator'
-            last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
+           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
         elif isinstance(telethon_chat_member.participant, ChatParticipant):
             user_status = 'Member'
-            last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
+           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
         else:
             user_status = 'Not Available'
-            last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
+            #last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
 
+        if isinstance(last_joined, datetime):
+            last_joined = last_joined.strftime('%Y-%m-%d %H:%M:%S.%f') 
         
-        last_joined = last_joined.strftime('%Y-%m-%d %H:%M:%S.%f') if last_joined else None
 
         # Check if the specific combination of user_id and chat_id already exists
         cursor.execute(
@@ -1353,3 +1416,52 @@ def lookup_obligation_chat(chat_id):
         ''', (chat_id, ))
         obligation_chat_id = cursor.fetchone()
     return obligation_chat_id[0]
+
+
+def insert_last_scan(chat_id, last_scan_date=None):
+    if last_scan_date is None:
+        last_scan_date = datetime.utcnow()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE authorized_chats SET last_scan = ? WHERE chat_id = ?
+        ''', (last_scan_date.strftime("%Y-%m-%d %H:%M:%S.%f"), chat_id))
+        conn.commit()
+    return
+
+
+def lookup_last_scan(chat_id):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT last_scan
+            FROM authorized_chats
+            WHERE chat_id = ?
+        ''', (chat_id, ))
+        last_scan = cursor.fetchone()
+        last_scan_datetime = None
+        if last_scan and last_scan[0]:
+            last_scan_datetime = datetime.strptime(last_scan[0], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone)
+    return last_scan_datetime
+
+
+def import_blacklist_from_csv(csv_filename):
+    try:
+        with open(csv_filename, 'r', newline='') as csv_file:
+            csv_reader = csv.reader(csv_file)
+            next(csv_reader)  # Skip header row
+            blacklist_data = [[row[0], row[1], row[3], row[4]] for row in csv_reader]
+            # expected headers -- "CHAT ID", "USER ID", "USER NAME", "BAN COUNT", "MOST RECENT BAN"
+
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.executemany('''
+                INSERT OR IGNORE INTO blacklist (channel_id, user_id, ban_count, last_banned)
+                VALUES (?, ?, ?, ?)
+            ''', blacklist_data)
+            conn.commit()
+        logging.info("Blacklist data imported successfully.")
+        return blacklist_data
+    except Exception as e:
+        logging.error(f"Error importing blacklist data: {e}")
+        return []
