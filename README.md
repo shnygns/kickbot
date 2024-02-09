@@ -141,26 +141,32 @@ They will be kicked from the group, and you will be given a summary of the numbe
 Be sure to /start a private chat with the bot to receive messages and info. Here are some of the commands you can use:
 
 KICK COMMANDS
-/inactivekick (time) - Kick those who haven't posted files/media
-/inactiveban (time) - Ban those who haven't posted files/media
+/inactivekick (time) OR 
+/inactiveban (time) - Kick/Ban those who haven't posted media
 
 LOOKUPS
 /gcstats (time) - Shows # of posters vs lurkers in chat.
 /lurkinfo (id or @) - Look up user info in the kicked user db.
 
 WHITELIST
-/wl - Show whitelist for current chat.
-/wl_add (id or @) - Add user to whitelist.
-/wl_del (id or @) - Remove user to whitelist.
+/wl, 
+/wl_add (id or @), 
+/wl_del (id or @) - Show / add to / del from whitelist for current chat.
+
+BLACKLIST / BANNING
+/blacklist - Export a CSV of everyone ever banned by the bot.
+ ** Post this CSV in KB chat to import and ban.
+/noleavers - Turn on/off no-leavers mode (Leaving chat = uniban).
+/forgive - Unbans & removes from blacklist (/forgive in KB chat = universal unban).
+/blban - Bans anyone on KB's blacklist from the current chat.
 
 OTHER
 /3strikes - Turn on/off 3 strikes mode (2+ past kicks = ban).
-/cleandb - Cleans inactive chats from the DB (works only in private chat with bot).
-/help - Show this help message.
+/setbackup - Sets an obligation chat the user must already be in, in order to enter this chat.
+/wholeft - Export a CSV of everyone who ever left the chat.
 
-(time) units use (s)econds, (m)inutes, (h)ours, (d)ays, (M)onths, or (y)ears.\n" 
-
-For example, the command /inactivekick 1d would kick all who have not posted in the last day, or who have never posted."
+(time) units use (s)econds, (m)inutes, (h)ours, (d)ays, (M)onths, or (y)ears.
+For example, the command /inactivekick 1d would kick all who have not posted in the last day, or who have never posted.
 
 
 
