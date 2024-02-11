@@ -103,7 +103,7 @@ from telethon.tl.types import (
 )
 from telegram import Update, ChatMember, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType, ParseMode
-from telegram.error import RetryAfter, Forbidden, TimedOut, BadRequest, NetworkError, BadRequestError
+from telegram.error import RetryAfter, Forbidden, TimedOut, BadRequest, NetworkError
 from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
