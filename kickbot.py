@@ -103,7 +103,7 @@ from telethon.tl.types import (
 )
 from telegram import Update, ChatMember, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatType, ParseMode
-from telegram.error import RetryAfter, Forbidden, TimedOut, BadRequest, NetworkError
+from telegram.error import RetryAfter, Forbidden, TimedOut, BadRequest, NetworkError, BadRequestError
 from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
@@ -123,7 +123,7 @@ log_handler = TimedRotatingFileHandler('app.log', when=when, interval=interval, 
 log_handler.suffix = "%Y-%m-%d"  # Suffix for log files (e.g., 'my_log.log.2023-10-22')
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         log_handler,
@@ -604,22 +604,22 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
             suspend_joiner_logging = (not last_scan) or (last_scan and (datetime.utcnow().replace(tzinfo=utc_timezone) - last_scan) > timedelta(minutes=10))
             if suspend_joiner_logging:
                 logging.warning(f"First scan in at least 10 minutes. Suspending joiner logging.")
-            else:
+            #else:
                 #obligation_chat = None
                 #if obligation_chat_id:
                     #obligation_chat = await telethon.get_entity(obligation_chat_id) 
                     #obligation_chat = await kickbot.getChat(obligation_chat_id)
 
-                for joined_user_id in joined_user_ids:
+                #for joined_user_id in joined_user_ids:
                     #joined_member = await telethon.get_entity(joined_user_id)
-                    joined_member = await kickbot.get_chat_member(chat_id, joined_user_id)
-                    joined_user_name = (f"{joined_member.user.first_name if joined_member.user.first_name else ''} {joined_member.user.last_name if joined_member.user.last_name else ''}")
-                    logging.warning(f"SCAN: {chat_id} -- {joined_user_name} - {joined_member.user.username}"
-                                    f"{' -ADMIN' if joined_user_id in AUTHORIZED_ADMINS or joined_user_id in admin_ids else ''} "
-                                    f"joining {chat.title}. Prior Status: {member_previous_status.get(joined_user_id) if member_previous_status else 'N/A'} - "
-                                    f"New Status: {participant_dict.get(joined_user_id) if participant_dict.get(joined_user_id) else 'N/A'} "
-                                    f"{'(OBLIGATION: '+ chat_name_dict.get(obligation_chat_id)+ ')' if obligation_chat_id else ''}"
-                                    )
+                    #joined_member = await kickbot.get_chat_member(chat_id, joined_user_id)
+                    #joined_user_name = (f"{joined_member.user.first_name if joined_member.user.first_name else ''} {joined_member.user.last_name if joined_member.user.last_name else ''}")
+                    ##logging.warning(f"SCAN: {chat_id} -- {joined_user_name} - {joined_member.user.username}"
+                    #                f"{' -ADMIN' if joined_user_id in AUTHORIZED_ADMINS or joined_user_id in admin_ids else ''} "
+                    #                f"joining {chat.title}. Prior Status: {member_previous_status.get(joined_user_id) if member_previous_status else 'N/A'} - "
+                    #                f"New Status: {participant_dict.get(joined_user_id) if participant_dict.get(joined_user_id) else 'N/A'} "
+                    #                f"{'(OBLIGATION: '+ chat_name_dict.get(obligation_chat_id)+ ')' if obligation_chat_id else ''}"
+                    #                )
 
 
         # Step 6: Batch update the database for users that have left
@@ -1364,19 +1364,19 @@ async def clean_database(update, context):
 async def find_inactive_chats():
     active_chats = []
     inactive_chats = []
-    rt = 0
     try:
         chat_ids_in_database = list_chats_in_db()
         active_str = "CURRENT ACTIVE CHATS\n"
         inactive_str = "INACTIVE CHATS IN DATABASE\n"
         for chat_id in chat_ids_in_database:
+            rt = 0
             while rt < max_retries:
                 try:
-                    #chat = await telethon.get_entity(chat_id)
+                    # chat = await telethon.get_entity(chat_id)
                     chat = await kickbot.get_chat(chat_id)
                     is_chat_authorized(chat_id, chat.title)
                     if chat.type == ChatType.PRIVATE:
-                    #if not a private bot chat:
+                        # if not a private bot chat:
                         inactive_chats.append(chat_id)
                         inactive_str = inactive_str + f"{chat_id}\n"
                         break
@@ -1390,20 +1390,29 @@ async def find_inactive_chats():
                     await asyncio.sleep(wait_seconds)
                     rt += 1
                     if rt == max_retries:
-                        logging.warning(f"Max retry limit reached. Message not sent.")
+                        logging.warning(f"Max retry limit reached. Chat {chat.title} not classified.")
                         break
                 except (ChannelPrivateError, Forbidden) as e:
+                    # Assuming chat is active and the bot is not in them or does not possess rights to query
+                    active_chats.append(chat_id)
+                    active_str = active_str + f"{chat_id}\n"
+                    break
+                except (BadRequestError, BadRequest) as e:
+                    # Expecting deleted chats to get this error
                     inactive_chats.append(chat_id)
                     inactive_str = inactive_str + f"{chat_id}\n"
+                    logging.warning(f"Bad Request occurred in chat {chat_id}: Possible that {chat.title} has nuked.")
                     break
                 except Exception as e:
-                    inactive_chats.append(chat_id)
-                    inactive_str = inactive_str + f"{chat_id}\n"
+                    # Unknown exception, being conservative and not labeling as inactive.
+                    active_chats.append(chat_id)
+                    active_str = active_str + f"{chat_id}\n"
+                    logging.warning(f"Unhandled exception occurred in chat {chat_id}: {e}")
                     break
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
         await debug_to_chat(exc_type, exc_value, exc_traceback)
-        logging.error(f"An error occured while cleaning the database: {e}")
+        logging.error(f"An error occurred while cleaning the database: {e}")
     return active_chats, inactive_chats, active_str, inactive_str
 
 
@@ -1832,10 +1841,10 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         obligation_found = ' - FOUND)'
 
-                logging.warning(f"REALTIME: {chat_id} -- {user_name} - {username} "
-                f"joining {chat_name}. Previous DB Status: {member_record_dict['status'] if member_record_dict else 'NOT FOUND'} "
-                f"{'(OBLIGATION: '+ obligation_chat_name if obligation_chat_id else '' } {obligation_found if obligation_found else ''}"
-                )
+                #logging.warning(f"REALTIME: {chat_id} -- {user_name} - {username} "
+                #f"joining {chat_name}. Previous DB Status: {member_record_dict['status'] if member_record_dict else 'NOT FOUND'} "
+                #f"{'(OBLIGATION: '+ obligation_chat_name if obligation_chat_id else '' } {obligation_found if obligation_found else ''}"
+                #)
             else:
                 logging.info(f"REALTIME: User ID {user_id} '{user_name}' entered chat {chat_id} '{chat_name}'. Admin. Ignoring.")
         if (not is_member and was_member) and user_id != context.bot.id and not kick_started:
@@ -1851,7 +1860,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 member = lookup_group_member(user_id, chat_id)
                 status = member[0]['status'] if member else None
                 logging.warning(f"REALTIME: {chat_id} -- {user_name} - {username} leaving {chat_name}. "
-                    f"Ban Leavers mode for {chat_name} is {'ON' if ban_leavers_mode[0]==1 else 'OFF'}. Current DB Status: {status}. "
+                    f"Ban Leavers mode is {'ON' if ban_leavers_mode[0]==1 else 'OFF'}. "
                     f"Excuse list contains: {let_leave_without_banning}"
                 )
                 if ban_leavers_mode[0]==1 and user_id not in AUTHORIZED_ADMINS and user_id not in admin_ids and not excused and shinfree:
