@@ -596,14 +596,14 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
         user_ids_to_ban = left_user_ids - admin_ids - let_leave_without_banning - shin_ids
         results = {'chat_id': chat_id, 'joined_user_ids': joined_user_ids}
         # Step 5.5: If obligations is on, joiners who meet certain conditions must be analyzed and possibly kicked.
-        obligation_chat_id = lookup_obligation_chat(chat_id)
+        # obligation_chat_id = lookup_obligation_chat(chat_id)
         
         logging.warning(f"SCAN: {chat_id} -- {chat.title} Kickbot found {len(joined_user_ids)} users who showed in the scan of {chat_id} but were not listed as members in the DB.")
-        if is_supergroup and len(joined_user_ids) > 0:
-            last_scan = lookup_last_scan(chat_id)
-            suspend_joiner_logging = (not last_scan) or (last_scan and (datetime.utcnow().replace(tzinfo=utc_timezone) - last_scan) > timedelta(minutes=10))
-            if suspend_joiner_logging:
-                logging.warning(f"First scan in at least 10 minutes. Suspending joiner logging.")
+        #if is_supergroup and len(joined_user_ids) > 0:
+        #    last_scan = lookup_last_scan(chat_id)
+        #    suspend_joiner_logging = (not last_scan) or (last_scan and (datetime.utcnow().replace(tzinfo=utc_timezone) - last_scan) > timedelta(minutes=10))
+            #if suspend_joiner_logging:
+            #    logging.warning(f"First scan in at least 10 minutes. Suspending joiner logging.")
             #else:
                 #obligation_chat = None
                 #if obligation_chat_id:
@@ -867,7 +867,7 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
             # Process obligation kicks in batch
             for results in results_list:
                 results_chat_id = results['chat_id']
-                results_chat = await kickbot.get_chat(results_chat_id)
+                results_chat = await kickbot.get_chat(results_chat_id)  #****** BUG FIX NEEDED ****** CREATE AN EXCEPTION FOR BAD REQUEST, FORBIDDEN; CLEAN DB
                 results_chat_type = results_chat.type
                 results_joined_user_ids = results['joined_user_ids']
                 admins = lookup_admin_ids(results_chat_id)
@@ -890,10 +890,22 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
             update_left_groups()
             let_leave_without_banning.clear()
         print("Update completed.")
+        return
+    except (BadRequest, Forbidden) as e:
+        active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
+        if len(inactive_chats) > 0:
+            logging.warning("Found inactive chats. Cleaning database.\n")
+            logging.warning(inactive_str)
+            del_chats_from_db(inactive_chats)
+            logging.warning("Purging...\n")
+            logging.warning("Inactive channels deleted.\n")
+            logging.warning(active_str)  
+            return
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
         await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
         logging.error(f"Error in the update_chat_members() function: {e}")
+        return
 
 
 # Function to run the scheduled tasks
@@ -1392,12 +1404,12 @@ async def find_inactive_chats():
                     if rt == max_retries:
                         logging.warning(f"Max retry limit reached. Chat {chat.title} not classified.")
                         break
-                except (ChannelPrivateError, Forbidden) as e:
+                except ChannelPrivateError as e:
                     # Assuming chat is active and the bot is not in them or does not possess rights to query
                     active_chats.append(chat_id)
                     active_str = active_str + f"{chat_id}\n"
                     break
-                except (BadRequestError, BadRequest) as e:
+                except (BadRequestError, BadRequest, Forbidden) as e:
                     # Expecting deleted chats to get this error
                     inactive_chats.append(chat_id)
                     inactive_str = inactive_str + f"{chat_id}\n"
