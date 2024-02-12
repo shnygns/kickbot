@@ -1404,12 +1404,7 @@ async def find_inactive_chats():
                     if rt == max_retries:
                         logging.warning(f"Max retry limit reached. Chat {chat.title} not classified.")
                         break
-                except ChannelPrivateError as e:
-                    # Assuming chat is active and the bot is not in them or does not possess rights to query
-                    active_chats.append(chat_id)
-                    active_str = active_str + f"{chat_id}\n"
-                    break
-                except (BadRequestError, BadRequest, Forbidden) as e:
+                except (BadRequestError, BadRequest, Forbidden, ChannelPrivateError) as e:
                     # Expecting deleted chats to get this error
                     inactive_chats.append(chat_id)
                     inactive_str = inactive_str + f"{chat_id}\n"
