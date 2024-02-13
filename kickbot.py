@@ -692,7 +692,7 @@ async def uniban_from_list(user_id_list, add_to_bl = True):
     for chat_id in chat_ids_in_database:
         try:
             admins = await kickbot.get_chat_administrators(chat_id)
-            admin_ids = [admin.id for admin in admins]
+            admin_ids = [admin.user.id for admin in admins]
             if kickbot.id not in admin_ids:
                 continue
         
@@ -1623,7 +1623,7 @@ async def set_backup(update, context):
             admins = await kickbot.get_chat_administrators(active_id)
             admin_ids = [admin.user.id for admin in admins]
             if kickbot.id in admin_ids:
-                i_am_admin.append(chat_id)
+                i_am_admin.append(active_id)
 
 
         if len(i_am_admin)<2:
