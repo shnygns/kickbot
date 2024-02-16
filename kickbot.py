@@ -213,9 +213,16 @@ def authorized_chat_check(handler_function):
             try:      
                 admins = await update.effective_chat.get_administrators()
             
-            except (BadRequest, Forbidden) as e:
-                delete_authorized_chat(chat_id)
-                logging.error(f"An access error occured in authorized_chat_check() for {chat_id} - {chat_title}: Deauthorizing")
+            except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
+                logging.error(f"An access error occured in authorized_chat_check() for {chat_id} - {chat_title}. Cleaning databases.")
+                active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
+                if len(inactive_chats) > 0:
+                    logging.warning("Found inactive chats. Cleaning database.\n")
+                    logging.warning(inactive_str)
+                    del_chats_from_db(inactive_chats)
+                    logging.warning("Purging...\n")
+                    logging.warning("Inactive channels deleted.\n")
+                    logging.warning(active_str)  
                 return
             except Exception:
                 return
@@ -277,9 +284,16 @@ def is_admin_of_authorized_chat_check(handler_function):
             try:      
                 admins = await update.effective_chat.get_administrators()
             
-            except (BadRequest, Forbidden) as e:
-                delete_authorized_chat(chat_id)
-                logging.error(f"An access error occured in authorized_chat_check() for {chat_id} - {chat_title}: Deauthorizing")
+            except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
+                logging.error(f"An access error occured in authorized_chat_check() for {chat_id} - {chat_title}. Cleaning databases.")
+                active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
+                if len(inactive_chats) > 0:
+                    logging.warning("Found inactive chats. Cleaning database.\n")
+                    logging.warning(inactive_str)
+                    del_chats_from_db(inactive_chats)
+                    logging.warning("Purging...\n")
+                    logging.warning("Inactive channels deleted.\n")
+                    logging.warning(active_str)  
                 return
             
             except Exception:
@@ -672,11 +686,10 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
         scanning_underway.remove(chat_id)
         print(f"Update of {chat_id} completed.")
     
-    except (BadRequest, BadRequestError) as e:
-        active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
-        if len(inactive_chats) > 0:
-            logging.warning(f"Bot does not seem to have Admin rights in {chat.title} Chat processessing not completed.\n")
-            scanning_underway.remove(chat_id)
+    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
+        logging.warning(f"Bot does not seem to have Admin rights in {chat.title} Chat processessing not completed.\n")
+        scanning_underway.remove(chat_id)
+        return
     
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
@@ -705,7 +718,7 @@ async def uniban_from_list(user_id_list, add_to_bl = True):
                 if add_to_bl:
                     insert_userlist_into_blacklist(user_id_list, chat_id)
                 await asyncio.gather(*(ban_user(user_id) for user_id in user_id_list))
-        except (ChannelPrivateError, BadRequest, Forbidden) as e:
+        except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
             logging.warning(f"Can't ban from {chat.title} - PRIVATE ERROR - May no longer be active")
             break
         except Exception as e:
@@ -731,7 +744,7 @@ async def ban_from_imported_blacklist(blacklist_data):
                 logging.warning(f"Banning blacklisted users from {chat.title}")
 
                 await asyncio.gather(*(ban_user(user_id) for user_id in banned_users_for_this_chat))
-        except (ChannelPrivateError, Forbidden, BadRequest) as e:
+        except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
             logging.warning(f"Can't ban from {chat.title} - PRIVATE ERROR - May no longer be active")
             break
         except Exception as e:
@@ -901,7 +914,7 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
             let_leave_without_banning.clear()
         print("Update completed.")
         return
-    except (BadRequest, Forbidden, ChannelPrivateError) as e:
+    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
         active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
         if len(inactive_chats) > 0:
             logging.warning("Found inactive chats. Cleaning database.\n")
@@ -1083,7 +1096,7 @@ async def chat_status(update: Update, context: CallbackContext):
     try:
         admins = await update.effective_chat.get_administrators()
         admin_ids = [admin.user.id for admin in admins]
-    except (BadRequest, Forbidden) as e:
+    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
         logging.warning(f"Bad Request/Forbidden in chat_status() - Bot no longer in group.")
         return
         
@@ -1313,7 +1326,7 @@ async def lookup(update: Update, context: CallbackContext):
             kicked_user_last_kicked = datetime.strptime(kicked_user_row[4], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if kicked_user_row else None
             try:
                 chat_member = await context.bot.get_chat_member(kicked_user_chat_id, kicked_user_id)
-            except (BadRequest, BadRequestError) as e:
+            except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
                 logging.warning(f"Bad lookup request error in {chat_name}: {e}")
                 continue
 
@@ -1786,12 +1799,12 @@ async def obligation_kick(user_id, chat_id, chat_type, user_name, obligation_cha
             logging.warning(f"An error occured in obligation_kick() - Permission issue kicking {user_name} from {chat_id}. -  {e}")
             break  
 
-        except (BadRequest, BadRequestError) as e:
-            logging.warning(f"An error occured in obligation_kick() - Obligation kicks don't work in closed topics. -  {e}")
+        except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
+            logging.warning(f"An error occured in obligation_kick() - Closed topic, nuke, or bot missing. -  {e}")
             break  
 
-        except (Forbidden, ValueError) as e:
-            logging.warning(f"An error occured in obligation_kick(): {e}")
+        except (ValueError) as e:
+            logging.warning(f"A value error occured in obligation_kick(): {e}")
             break
 
         except RetryAfter as e:
@@ -1916,10 +1929,10 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logging.warning(f"REALTIME: {user_name} KICKED FROM {chat_name} FOR NOT BELONGING TO OBLIGATION CHAT.")
                 let_leave_without_banning.discard((user_id, chat_id))
 
-    except (TimeoutError, TimedOut, NetworkError, BadRequest) as e:
+    except (TimeoutError, TimedOut, NetworkError) as e:
         logging.error(f"Timeout error in the handle_new_member() function: {e}")
 
-    except (ChannelPrivateError, BadRequest, Forbidden) as e:
+    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
         logging.warning(f"PRIVATE ERROR in handle_new_member() - {chat_name} may no longer be active")
 
     except ValueError as e:
@@ -1937,17 +1950,19 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @authorized_chat_check
 async def handle_message(update: Update, context: CallbackContext): 
     global telethon
-    if telethon.is_connected() == False:
-        telethon.connect()
-    chat_type = update.effective_chat.type
-    # Kickbot private chats do not process ordinary messages.
-    if chat_type == ChatType.PRIVATE:
-        if update.message.from_user.id in AUTHORIZED_ADMINS and update.message.document and update.message.document.file_name == "blacklist.csv":
-            await handle_blacklist_import(update, context)
-            return
+
     rt = 0
     while rt < max_retries:
-        try:
+        try:  
+            if telethon.is_connected() == False:
+                telethon.connect()
+            chat_type = update.effective_chat.type
+            # Kickbot private chats do not process ordinary messages.
+            if chat_type == ChatType.PRIVATE:
+                if update.message.from_user.id in AUTHORIZED_ADMINS and update.message.document and update.message.document.file_name == "blacklist.csv":
+                    await handle_blacklist_import(update, context)
+                    return
+
             chat_id = update.effective_message.chat_id
             chat_name = update.effective_chat.title
             user = update.effective_user
@@ -1957,11 +1972,10 @@ async def handle_message(update: Update, context: CallbackContext):
             # No matter what the message contains, capture the sender in the DB 
             insert_user_in_db(user_id, chat_id, "user_activity")
 
-
-
             # If the message contained acceptable media, process further
             if update.effective_message.document or update.effective_message.photo or update.effective_message.video:
                 date = update.effective_message.date
+                chat_member = None
                 try:
                     chat_member = await context.bot.get_chat_member(chat_id, user_id)
                 except TimedOut as e:
@@ -1981,7 +1995,7 @@ async def handle_message(update: Update, context: CallbackContext):
                     await debug_message(context, chat_id, user_name, DEBUG_ADMIN_MESSAGE)
             break
 
-        except (ChannelPrivateError, BadRequest, Forbidden) as e:
+        except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
             logging.warning(f"PRIVATE ERROR - {chat_name} may no longer be active")
             break
 
@@ -2351,7 +2365,7 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
         try:
             admins = await update.effective_chat.get_administrators()
             admin_ids = [admin.user.id for admin in admins]
-        except (BadRequest, Forbidden) as e:
+        except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
             logging.warning(f"Bad Request/Forbidden in chat_status() - Bot no longer in group.")
             return
 
