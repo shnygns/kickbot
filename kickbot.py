@@ -937,13 +937,13 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
                                 if len(lookup)==0:
                                     # If user not found locally in obligation chat, verify with a get_chat_member lookup before kicking
                                     joined_chat_obligation_member = await kickbot.get_chat_member(obligation_chat_id, joined_user_id)
-                                    joined_user_obligation_member_dict = {}
+                                    joined_user_member_dict = {}
                                     if joined_chat_obligation_member.status not in ["administrator", "creator", "member"]:
-                                        joined_user_obligation_member_dict = lookup_group_member(joined_user_id)
-                                        joined_user_obligation_member_dict = joined_user_obligation_member_dict[0] if len(joined_user_obligation_member_dict)>0 else None
-                                        joined_user_name = (f"{joined_user_obligation_member_dict.get('user_name') if joined_user_obligation_member_dict else ''}")
+                                        joined_user_member_dict = lookup_group_member(joined_user_id)
+                                        joined_user_member_dict = joined_user_member_dict[0] if len(joined_user_member_dict)>0 else None
+                                        joined_user_name = (f"{joined_user_member_dict.get('user_name') if joined_user_member_dict else ''}")
 
-                                        logging.warning(f"SCAN: {results_chat_id} OBLIGATION KICK: {joined_user_name} kicked from {chat_name_dict.get('results_chat_id')}{results_chat_id}.")
+                                        logging.warning(f"SCAN: {results_chat_id} OBLIGATION KICK: {joined_user_name} ({joined_user_id} - @{joined_user_member_dict.get('username') }) kicked from {chat_name_dict.get('results_chat_id')} for not belonging to {chat_name_dict.get(obligation_chat_id)}.")
 
                                         joined_user_telethon = await telethon.get_entity(joined_user_id)
                                         await obligation_kick(joined_user_id, results_chat_id, results_chat_type, joined_user_name, chat_name_dict.get(obligation_chat_id))
