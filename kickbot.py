@@ -821,11 +821,12 @@ async def unban(update: Update=None, context: CallbackContext=None):
     except (IndexError, ValueError) as e:
         await context.bot.send_message(chat_id=issuer_user_id, text="Invalid command format. Use /forgive <user> (e.g., /forgive @some_dude).")
         logging.error(f"An error occurred in kick_inactive_users(), probably due to an invalid time argument.")  
+        return
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
         await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
         logging.warning(f"Unban argument error: {e}")  
-
+        return
     try:
         id_or_username = int(id_or_username)
     except:
