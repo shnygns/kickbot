@@ -2715,11 +2715,6 @@ async def import_blacklist_callback_query_handler_loop(update: Update, context: 
     return
 
 
-@authorized_admin_check
-async def restart_bot_loop(update: Update, context: CallbackContext):
-    asyncio.create_task(restart_bot(update, context))
-    return
-
 # ********* STOP AND RESTART **********
 
 async def stop_and_restart():
