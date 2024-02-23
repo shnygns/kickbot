@@ -1201,7 +1201,7 @@ def update_left_groups():
 
                 # Calculate time_in_group as HH:MM:SS
                 time_in_group = str(last_left - last_joined)
-                logging.warning(f"INSERTING INTO LEFT GROUP DB: {user_id} - {time_in_group}")
+                #logging.warning(f"INSERTING INTO LEFT GROUP DB: {user_id} - {time_in_group}")
 
 
                 # Append the data to the list
