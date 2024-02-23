@@ -532,9 +532,7 @@ def calculate_cutoff_date(arg):
 
 async def process_chat_member_updates(chat_id, update: Update=None, context: CallbackContext=None):
     try:
-        global telethon
-        if not telethon.is_connected():
-            telethon.start(bot_token=BOT_TOKEN)
+        await check_telethon_connection()
         global scanning_underway
         scanning_underway.append(chat_id)
         try:
@@ -545,6 +543,10 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
         chat_name_dict = get_chat_ids_and_names()
         admin_ids = lookup_admin_ids(chat_id)
         shin_ids = set(keyword_search_from_db('shinanygans'))
+        whitelist_data = get_whitelist(chat_id)
+
+        # Convert user_data and admin_ids into sets for faster lookups
+        whitelist_set = {entry[0] for entry in whitelist_data}
 
         # Step 1: Fetch the list of user_ids from the chat_member table for the given chat_id
         member_ids_in_db = set(list_member_ids_in_db(chat_id)) # Users who are currently 'Member' or 'Admin' of 'Creator' status
@@ -658,7 +660,11 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
             if isinstance(result, Exception):
                 logging.warning(f"SCAN: get_chat_member() returned an exception for {result_user_id}: {result} - Retrying.")
                 retried_chat_member = None
-                retried_chat_member = await kickbot.get_chat_member(chat_id, result_user_id)
+                try:
+                    retried_chat_member = await kickbot.get_chat_member(chat_id, result_user_id)
+                    logging.warning(f"SCAN: get_chat_member() retry for {result_user_id} succeeded.")
+                except Exception as e:
+                    logging.warning(f"SCAN: get_chat_member() retry for {result_user_id} failed. {e}")
                 if retried_chat_member.status == 'left':
                     left_user_ids.add(result_user_id)
             elif result.status in ["member", "administrator", "creator"]:
@@ -673,7 +679,7 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
 
         joined_user_ids = participant_user_ids - member_ids_in_db.union(unknown_status_in_db) # Current chat occupants minus Members/Admins/Not Available in DB = Net new + rejoins and unbanned
         unbanned_user_ids = joined_user_ids.intersection(banned_ids_in_db) # Currently banned in the DB but rejoined the group
-        user_ids_to_ban = left_user_ids - admin_ids - let_leave_without_banning - shin_ids
+        user_ids_to_ban = left_user_ids - admin_ids - let_leave_without_banning - shin_ids - whitelist_set
         results = {'chat_id': chat_id, 'joined_user_ids': joined_user_ids}
         
         logging.warning(f"SCAN: {chat_id} ({chat.title}) -- Kickbot scan found {len(joined_user_ids)} new users.")
@@ -714,15 +720,15 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
             except AttributeError as e:
                 logging.error(f" Error getting banned participant information during lookup: {e}")
                 # Remove the users already banned in the database, so as to only update those who were not banned before the scan.
-                update_ban_status = banned_user_ids - banned_ids_in_db
+            update_ban_status = banned_user_ids - banned_ids_in_db
 
-                # Set status, last_banned, and times_banned fields for those just banned
-                batch_update_banned(update_ban_status, chat_id)
+            # Set status, last_banned, and times_banned fields for those just banned
+            batch_update_banned(update_ban_status, chat_id)
 
-                # Arrive at a list of manually-unbanned users by subtracting currently banned users from those marked as banned in the DB.
-                manually_unbanned =  banned_ids_in_db - banned_user_ids
-                remove_unbanned_user_from_blacklist(manually_unbanned, chat_id)
-                batch_update_left(manually_unbanned, chat_id)
+            # Arrive at a list of manually-unbanned users by subtracting currently banned users from those marked as banned in the DB.
+            manually_unbanned =  banned_ids_in_db - banned_user_ids
+            remove_unbanned_user_from_blacklist(manually_unbanned, chat_id)
+            batch_update_left(manually_unbanned, chat_id)
 
 
         else:
@@ -965,9 +971,13 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
                     chat_name_dict = get_chat_ids_and_names()
                     suspend_obligation_kicks = (not last_scan) or (last_scan and (datetime.utcnow().replace(tzinfo=utc_timezone) - last_scan) > timedelta(minutes=10))
                     obligation_chat_id = lookup_obligation_chat(results_chat_id)
+                    whitelist_data = get_whitelist(chat_id)
+
+                    # Convert user_data and admin_ids into sets for faster lookups
+                    whitelist_set = {entry[0] for entry in whitelist_data}
                     if obligation_chat_id and not suspend_obligation_kicks:
                         for joined_user_id in results_joined_user_ids:
-                            if joined_user_id not in AUTHORIZED_ADMINS and joined_user_id not in admins and joined_user_id not in shin_ids:
+                            if joined_user_id not in AUTHORIZED_ADMINS and joined_user_id not in admins and joined_user_id not in whitelist_set and joined_user_id not in shin_ids:
                                 lookup = lookup_active_group_member(joined_user_id, obligation_chat_id)
                                 logging.warning(f"SCAN: Joining user {joined_user_id} {'DOES' if len(lookup)>0 else 'DOES NOT'} appear in our internal DB for obligation chat {obligation_chat_id}")
                                 if len(lookup)==0:
@@ -1170,6 +1180,9 @@ async def chat_status(update: Update, context: CallbackContext):
     posted_in_last_12_hours = 0
     not_posted = 0
 
+    if not context.args[0]:
+        return
+
     try:
         admins = await update.effective_chat.get_administrators()
         admin_ids = [admin.user.id for admin in admins]
@@ -1286,8 +1299,9 @@ async def ban_from_blacklist(update: Update, context: CallbackContext):
             text=f"BANNING BLACKLISTED USERS FROM {chat_name}"
         )       
             blacklisted_uids = []
-            for blacklisted_user in blacklist:
-                uid = blacklisted_user[0]
+            # Use a set to store unique user IDs
+            unique_blacklisted_uids = set(blacklisted_user[0] for blacklisted_user in blacklist)    
+            for uid in unique_blacklisted_uids:
                 try:
                     await context.bot.ban_chat_member(chat_id, uid)
                     blacklisted_uids.append(uid)
@@ -1489,6 +1503,7 @@ async def find_inactive_chats():
     inactive_chats = []
     try:
         chat_ids_in_database = list_chats_in_db()
+        chat=None
         active_str = "CURRENT ACTIVE CHATS\n"
         inactive_str = "INACTIVE CHATS IN DATABASE\n"
         for chat_id in chat_ids_in_database:
@@ -1510,12 +1525,12 @@ async def find_inactive_chats():
                         break
                 except (RetryAfter, TimedOut, TimeoutError, NetworkError) as e:
                     wait_seconds = e.retry_after if hasattr(e, 'retry_after') else 3
-                    logging.warning(f"Error in find_inactive_chats() - {e} Waiting for {wait_seconds} seconds...")
+                    logging.warning(f"Error in find_inactive_chats() - {e}.  Waiting for {wait_seconds} seconds...")
                     await asyncio.sleep(wait_seconds)
                     rt += 1
                     if rt == max_retries:
                         logging.warning(f"Max retry limit reached. Chat {chat.title} not classified.")
-                        break
+                        # "break" statement would be redundant here. Omitting.
                 except (BadRequestError, BadRequest, Forbidden, ChannelPrivateError) as e:
                     # Expecting deleted chats to get this error
                     inactive_chats.append(chat_id)
@@ -1860,12 +1875,12 @@ async def obligation_kick(user_id, chat_id, chat_type, user_name, obligation_cha
             
             if (chat_type == ChatType.SUPERGROUP or chat_type == ChatType.CHANNEL):
                 let_leave_without_banning.add((user_id, chat_id))
-                logging.warning(f"User ID {user_id} added to LET LEAVE WITHOUT BAN. Printing full list contents:")
+                logging.warning(f"User ID {user_id} added to LET LEAVE WITHOUT BAN.")
                 await kickbot.unban_chat_member(chat_id, user_id)
             else:
                 await kickbot.ban_chat_member(chat_id, user_id)
                 insert_kicked_user_in_blacklist(user_id, chat_id)      
-            logging.warning(let_leave_without_banning)
+            #logging.warning(let_leave_without_banning)
             break
 
         except UserAdminInvalidError as e:
@@ -1938,6 +1953,10 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ] or (new_status == ChatMember.RESTRICTED and new_is_member is True)
 
     try:
+        whitelist_data = get_whitelist(chat_id)
+
+        # Convert user_data and admin_ids into sets for faster lookups
+        whitelist_set = {entry[0] for entry in whitelist_data}
         participant = await telethon.get_entity(user_id)
         if not was_member and is_member:
             member_record_dict = lookup_group_member(user_id, chat_id)
@@ -1953,7 +1972,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 supergroup = True if chat_type == ChatType.SUPERGROUP or chat_type == ChatType.CHANNEL else False
                 obligation_member = None
                 obligation_found = ''
-                if obligation_chat_id and supergroup and user_id not in AUTHORIZED_ADMINS and shinfree:
+                if obligation_chat_id and supergroup and user_id not in AUTHORIZED_ADMINS and user_id not in whitelist_set and shinfree:
                     obligation_member = await context.bot.get_chat_member(obligation_chat_id, user_id)
                     if not obligation_member or not hasattr(obligation_member, 'status') or obligation_member.status not in [ ChatMember.MEMBER,
                                                                                                                              ChatMember.ADMINISTRATOR,
@@ -1966,7 +1985,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         obligation_found = ' - FOUND)'
 
-                    logging.warning(f"REALTIME: {chat_id} -- {user_name} - {username} "
+                    logging.warning(f"REALTIME: {chat_id} -- {user_name} ({user_id}, @{username}) "
                     f"joining {chat_name}. Previous DB Status: {member_record_dict['status'] if member_record_dict else 'NOT FOUND'} "
                     f"{'(OBLIGATION: '+ obligation_chat_name if obligation_chat_id else '' } {obligation_found if obligation_found else ''}"
                     )
@@ -1985,11 +2004,11 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 shinfree = True if user_id not in shin_ids else False
                 member = lookup_group_member(user_id, chat_id)
                 status = member[0]['status'] if member else None
-                logging.warning(f"REALTIME: {chat_id} -- {user_name} (@{username}, {user_id}) leaving {chat_name}. "
+                logging.warning(f"REALTIME: {chat_id} -- {user_name} (@{username}, {user_id}) leaving {chat_name}. Chat status is: {new_status}. "
                     f"Ban Leavers mode is {'ON' if ban_leavers_mode[0]==1 else 'OFF'}. "
                     f"Obligation kick hallpass list: {let_leave_without_banning}"
                 )
-                if ban_leavers_mode[0]==1 and user_id not in AUTHORIZED_ADMINS and user_id not in admin_ids and not excused and shinfree:
+                if ban_leavers_mode[0]==1 and user_id not in AUTHORIZED_ADMINS and user_id not in admin_ids and user_id not in whitelist_set and not excused and shinfree:
                     left_user_ids = [user_id]
                     if status == "Kicked":
                         logging.warning(f"REALTIME: BAN-LEAVERS MODE ON FOR {chat_id}, BUT {user_name} ALREADY KICKED. DOING NOTHING.")
@@ -2690,67 +2709,36 @@ async def set_backup_loop(update: Update, context: CallbackContext):
     asyncio.create_task(set_backup(update, context))
     return
 
+
 async def import_blacklist_callback_query_handler_loop(update: Update, context: CallbackContext):
     asyncio.create_task(import_blacklist_callback_query_handler(update, context))
     return
 
+
+@authorized_admin_check
+async def restart_bot_loop(update: Update, context: CallbackContext):
+    asyncio.create_task(restart_bot(update, context))
+    return
+
 # ********* STOP AND RESTART **********
 
-def stop_and_restart():
+async def stop_and_restart():
     """Gracefully stop the Updater and replace the current process with a new one"""
-    app.stop()
+    await app.stop()
     os.execl(sys.executable, sys.executable, *sys.argv)
 
 @authorized_admin_check
-def restart(update, context):
-    update.message.reply_text('Bot is restarting...')
-    Thread(target=stop_and_restart).start()
-
-@authorized_admin_check
-async def restart_bot(update, context):
-    global app
+async def restart(update, context):
     try:
         if update.effective_chat.type != ChatType.PRIVATE:
             return
-        if update.effective_user.id not in [6862368034]:
+        if update.effective_user.id not in [6862368034, 861097305]:
             return
         await update.message.reply_text('Bot is restarting...')
-        await app.stop()
-        # Reinitialize components here (if feasible)
-        app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-        app.add_handler(CommandHandler("inactivekick", inactive_kick_loop))
-        app.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
-        app.add_handler(CommandHandler("quietkick", quiet_kick_loop))
-        app.add_handler(CommandHandler("inactiveban", inactive_ban_loop))
-        app.add_handler(CommandHandler("wl_add", whitelist_user_loop))
-        app.add_handler(CommandHandler("wl", show_whitelist_loop))
-        app.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
-        app.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
-        app.add_handler(CommandHandler("lurkinfo", lookup_loop))  
-        app.add_handler(CommandHandler("log", request_log_loop))     
-        app.add_handler(CommandHandler("gcstats", chat_status_loop)) 
-        app.add_handler(CommandHandler("start", start_command))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("cleandb", clean_database_loop)) 
-        app.add_handler(CommandHandler("test", update_chat_members))
-        app.add_handler(CommandHandler("track", start_chat_member_tracking))
-        app.add_handler(CommandHandler("stop", stop_chat_member_tracking))
-        app.add_handler(CommandHandler("wholeft", show_wholeft_loop))
-        app.add_handler(CommandHandler("noleavers", ban_leavers_mode_loop))
-        app.add_handler(CommandHandler("blacklist", get_blacklist_loop))
-        app.add_handler(CommandHandler("blban", ban_from_blacklist_loop))
-        app.add_handler(CommandHandler("forgive", unban_loop))
-        app.add_handler(CommandHandler("setbackup", set_backup_loop)) 
-        app.add_handler(CommandHandler("restart", restart_bot)) 
-        app.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
-        app.add_handler(CallbackQueryHandler(import_blacklist_callback_query_handler_loop, pattern='^blacklist_import_.*'))
-        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-        app.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
-        app.add_error_handler(error)
-        await app.run_polling()
+        #Thread(target=stop_and_restart).start()
+        asyncio.create_task(stop_and_restart())
     except Exception as e:
         logging.error(f"Failed to restart the bot: {e}")
-
 
 
 # ********* MAIN *********
@@ -2767,30 +2755,30 @@ def main() -> None:
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    application.add_handler(CommandHandler("inactivekick", inactive_kick_loop))
-    application.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
-    application.add_handler(CommandHandler("quietkick", quiet_kick_loop))
-    application.add_handler(CommandHandler("inactiveban", inactive_ban_loop))
-    application.add_handler(CommandHandler("wl_add", whitelist_user_loop))
-    application.add_handler(CommandHandler("wl", show_whitelist_loop))
-    application.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
-    application.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
-    application.add_handler(CommandHandler("lurkinfo", lookup_loop))  
-    application.add_handler(CommandHandler("log", request_log_loop))     
-    application.add_handler(CommandHandler("gcstats", chat_status_loop)) 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cleandb", clean_database_loop)) 
-    application.add_handler(CommandHandler("test", update_chat_members))
-    application.add_handler(CommandHandler("track", start_chat_member_tracking))
-    application.add_handler(CommandHandler("stop", stop_chat_member_tracking))
-    application.add_handler(CommandHandler("wholeft", show_wholeft_loop))
-    application.add_handler(CommandHandler("noleavers", ban_leavers_mode_loop))
-    application.add_handler(CommandHandler("blacklist", get_blacklist_loop))
-    application.add_handler(CommandHandler("blban", ban_from_blacklist_loop))
-    application.add_handler(CommandHandler("forgive", unban_loop))
-    application.add_handler(CommandHandler("setbackup", set_backup_loop)) 
-    application.add_handler(CommandHandler("restart", restart_bot)) 
+    application.add_handler(CommandHandler("dev_inactivekick", inactive_kick_loop))
+    application.add_handler(CommandHandler("dev_pretendkick", pretend_kick_loop))
+    application.add_handler(CommandHandler("dev_quietkick", quiet_kick_loop))
+    application.add_handler(CommandHandler("dev_inactiveban", inactive_ban_loop))
+    application.add_handler(CommandHandler("dev_wl_add", whitelist_user_loop))
+    application.add_handler(CommandHandler("dev_wl", show_whitelist_loop))
+    application.add_handler(CommandHandler("dev_wl_del", dewhitelist_user_loop))
+    application.add_handler(CommandHandler("dev_3strikes", three_strikes_mode_loop)) 
+    application.add_handler(CommandHandler("dev_lurkinfo", lookup_loop))  
+    application.add_handler(CommandHandler("dev_log", request_log_loop))     
+    application.add_handler(CommandHandler("dev_gcstats", chat_status_loop)) 
+    application.add_handler(CommandHandler("dev_start", start_command))
+    application.add_handler(CommandHandler("dev_help", help_command))
+    application.add_handler(CommandHandler("dev_cleandb", clean_database_loop)) 
+    application.add_handler(CommandHandler("dev_test", update_chat_members))
+    application.add_handler(CommandHandler("dev_track", start_chat_member_tracking))
+    application.add_handler(CommandHandler("dev_stop", stop_chat_member_tracking))
+    application.add_handler(CommandHandler("dev_wholeft", show_wholeft_loop))
+    application.add_handler(CommandHandler("dev_noleavers", ban_leavers_mode_loop))
+    application.add_handler(CommandHandler("dev_blacklist", get_blacklist_loop))
+    application.add_handler(CommandHandler("dev_blban", ban_from_blacklist_loop))
+    application.add_handler(CommandHandler("dev_forgive", unban_loop))
+    application.add_handler(CommandHandler("dev_setbackup", set_backup_loop)) 
+    application.add_handler(CommandHandler("dev_restart", restart)) 
     application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
     application.add_handler(CallbackQueryHandler(import_blacklist_callback_query_handler_loop, pattern='^blacklist_import_.*'))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
