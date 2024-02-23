@@ -15,6 +15,7 @@ from logging.handlers import TimedRotatingFileHandler
 import asyncio
 import pytz
 
+
 from config import (
     BOT_TOKEN,
     API_ID,
@@ -86,6 +87,7 @@ import time
 from datetime import datetime, timedelta
 from functools import wraps
 from tqdm import tqdm
+from threading import Thread
 import aioschedule as schedule
 from telethon.sync import TelegramClient
 from telethon.errors import TakeoutInitDelayError, ChannelPrivateError, BadRequestError, UserAdminInvalidError
@@ -140,6 +142,7 @@ logging.getLogger().addHandler(console_handler)
 
 telethon = None
 kickbot = None
+app = None
 tracking_chat_members = True
 max_retries = 3
 authorized_chats = set()
@@ -148,6 +151,7 @@ kick_started = False
 scanning_underway = []
 let_leave_without_banning = set()
 admin_participant_types = (ChannelParticipantAdmin, ChannelParticipantCreator, ChatParticipantAdmin, ChatParticipantCreator)
+attempting_telethon_restart = False
 
 # Initialize the SQLite database
 initialize_db()
@@ -328,6 +332,31 @@ def is_admin_of_authorized_chat_check(handler_function):
 
 
 # ********* UTILITIES *********
+
+async def check_telethon_connection() -> bool:
+    global telethon
+    global attempting_telethon_restart
+    if attempting_telethon_restart:
+        return
+    if telethon.is_connected():
+        #logging.warning(f"Error in telethon_restart. Client registers as connected.")
+        return
+    try:
+        # Attempt to gracefully disconnect
+        attempting_telethon_restart = True
+        await telethon.disconnect()
+    except Exception as disconnect_exception:
+        logging.warning(f"Error disconnecting Telethon prior to restart. {disconnect_exception} - Attempting reconnection anyway.")
+    try:
+        # Reinitialize and reconnect the client
+        telethon = TelegramClient('session_name', API_ID, API_HASH)
+        await telethon.start(bot_token=BOT_TOKEN)
+    except Exception as reconnect_exception:
+        logging.warning(f"Error reestablishing Telethon client. {reconnect_exception} - Abandoning.")
+        attempting_telethon_restart = False
+        return False
+    attempting_telethon_restart = False
+    return telethon.is_connected
 
 
 # Validate format of blacklist CSV imports
@@ -658,11 +687,16 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
         ban_leavers_mode = get_ban_leavers_status(chat_id)
         #If ban_leavers_mode is on, ban anyone with a status of "left"
         if ban_leavers_mode[0]==1:
+            last_scan = lookup_last_scan(chat_id)
+            suspend_banning = (not last_scan) or (last_scan and (datetime.utcnow().replace(tzinfo=utc_timezone) - last_scan) > timedelta(minutes=10))
             
             if len(user_ids_to_ban) > 0:
-                logging.warning(f"BAN-LEAVERS MODE ON FOR {chat_id} - THE FOLLOWING {len(user_ids_to_ban)} USERS WILL BE BANNED:")
-                logging.warning(user_ids_to_ban)
-                await uniban_from_list(user_ids_to_ban, reason = f'SCAN - LEFT {chat.title} WHILE NO-LEAVERS MODE ON')
+                if not suspend_banning:
+                    logging.warning(f"BAN-LEAVERS MODE ON FOR {chat_id} - THE FOLLOWING {len(user_ids_to_ban)} USERS WILL BE BANNED:")
+                    logging.warning(user_ids_to_ban)
+                    await uniban_from_list(user_ids_to_ban, reason = f'SCAN - LEFT {chat.title} WHILE NO-LEAVERS MODE ON')
+                else:
+                    logging.warning(f"BAN-LEAVERS MODE ON FOR {chat_id} - NO SCAN IN LAST 10 MINUTES - BANNING SUSPENDED.")
 
 
             for joined_user_id in joined_user_ids:
@@ -720,7 +754,7 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
 
 async def uniban_from_list(user_id_list, add_to_bl = True, reason = ''):
     async def ban_user(user_id, chat_id):
-        await telethon.edit_permissions(chat_id, user_id, view_messages=False)
+        await kickbot.ban_chat_member(chat_id, user_id)
     chat_ids_in_database = list_chats_in_db()
     for chat_id in chat_ids_in_database:
         try:
@@ -732,22 +766,21 @@ async def uniban_from_list(user_id_list, add_to_bl = True, reason = ''):
             chat = await kickbot.get_chat(chat_id)
             if chat.type == ChatType.PRIVATE:
                 logging.warning(f"Can't ban from {chat.title} - PRIVATE")
-            else:  
+                continue
 
-                logging.warning(f"Banning left users from {chat.title}")  
-                if add_to_bl:
-                    insert_userlist_into_blacklist(user_id_list, chat_id)
-                await asyncio.gather(*(ban_user(user_id, chat_id) for user_id in user_id_list))
-
-                for user_id in user_id_list:
-                    group_member_dict =  lookup_group_member(user_id, chat_id)
-                    group_member_dict = group_member_dict[0] if len(group_member_dict) > 0 else None
-                logging.warning(f"Banning {group_member_dict.get('user_name')} ({user_id} - @{group_member_dict.get('user_name')} from {chat.title} --- {reason}")
-
+            logging.warning(f"Banning left users from {chat.title}")  
+            #await asyncio.gather(*(ban_user(user_id, chat_id) for user_id in user_id_list))           
+            for banning_user_id in user_id_list:
+                group_member_dict =  lookup_group_member(banning_user_id, chat_id)
+                group_member_dict = group_member_dict[0] if len(group_member_dict) > 0 else None
+                logging.warning(f"Banning {group_member_dict.get('user_name')} ({banning_user_id} - @{group_member_dict.get('user_name')} from {chat.title} --- {reason}")
+                await kickbot.ban_chat_member(chat_id, banning_user_id)
+            if add_to_bl:
+                insert_userlist_into_blacklist(user_id_list, chat_id)
 
         except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
             logging.warning(f"Can't ban from {chat.title} - PRIVATE ERROR - May no longer be active")
-            break
+            continue
         except Exception as e:
             logging.warning(f"Uniban error: {e}")
     return
@@ -834,8 +867,7 @@ async def unban(update: Update=None, context: CallbackContext=None):
 
     try:
         global telethon
-        if telethon.is_connected() == False:
-            telethon.start(bot_token=BOT_TOKEN)
+        await check_telethon_connection()
         unban_user_entity = await telethon.get_entity(id_or_username)
         unban_user_id = unban_user_entity.id
         unban_user_list.append(unban_user_id)
@@ -921,7 +953,10 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
             # Process obligation kicks in batch
             if len(results_list)>0:
                 for results in results_list:
-                    results_chat_id = results['chat_id']
+                    try:
+                        results_chat_id = results['chat_id']
+                    except KeyError:
+                        continue
                     results_chat = await kickbot.get_chat(results_chat_id)  
                     results_chat_type = results_chat.type
                     results_joined_user_ids = results['joined_user_ids']
@@ -1173,9 +1208,7 @@ async def chat_status(update: Update, context: CallbackContext):
         obligation_chat = lookup_obligation_chat(chat_id)
 
         if API_ID and API_HASH:
-            global telethon
-            if telethon.is_connected() == False:
-                telethon.start(bot_token=BOT_TOKEN)
+            await check_telethon_connection()
             async for user in telethon.iter_participants(chat_id):
                 user_id = user.id
                 is_member = isinstance(user.participant, ChannelParticipant) or isinstance(user.participant, ChatParticipant)
@@ -1287,9 +1320,7 @@ async def lookup(update: Update, context: CallbackContext):
     except:
         pass   
     try:
-        global telethon
-        if telethon.is_connected() == False:
-            telethon.start(bot_token=BOT_TOKEN)
+        await check_telethon_connection()
         kicked_user = await telethon.get_entity(id_or_username)
         kicked_user_id = kicked_user.id
         
@@ -1466,7 +1497,8 @@ async def find_inactive_chats():
                 try:
                     # chat = await telethon.get_entity(chat_id)
                     chat = await kickbot.get_chat(chat_id)
-                    is_chat_authorized(chat_id, chat.title)
+                    #Use the authorization check as a way to update the chat name in the database
+                    is_chat_authorized(chat_id, chat.title)  
                     if chat.type == ChatType.PRIVATE:
                         # if not a private bot chat:
                         inactive_chats.append(chat_id)
@@ -1478,7 +1510,7 @@ async def find_inactive_chats():
                         break
                 except (RetryAfter, TimedOut, TimeoutError, NetworkError) as e:
                     wait_seconds = e.retry_after if hasattr(e, 'retry_after') else 3
-                    logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
+                    logging.warning(f"Error in find_inactive_chats() - {e} Waiting for {wait_seconds} seconds...")
                     await asyncio.sleep(wait_seconds)
                     rt += 1
                     if rt == max_retries:
@@ -1533,9 +1565,7 @@ async def show_wholeft(update: Update, context: CallbackContext):
             users_by_channel[channel_id].append((user_id, user_name, time_in_group))
 
         # Print the results
-        global telethon
-        if telethon.is_connected() == False:
-            telethon.start(bot_token=BOT_TOKEN)
+        await check_telethon_connection()
 
         csv_filename = "leavers.csv"
 
@@ -1677,9 +1707,7 @@ async def set_backup(update, context):
     issuer_chat_type = update.effective_chat.type
     issuer_chat_name = update.effective_chat.title
     try:
-        global telethon
-        if telethon.is_connected() == False:
-            telethon.start(bot_token=BOT_TOKEN)
+        await check_telethon_connection()
 
         if issuer_chat_type == ChatType.PRIVATE:
             message = await context.bot.send_message(
@@ -1816,10 +1844,8 @@ async def button_click(update, context):
 
 
 async def obligation_kick(user_id, chat_id, chat_type, user_name, obligation_chat_name): 
-    global telethon
     global let_leave_without_banning
-    if telethon.is_connected() == False:
-        telethon.start(bot_token=BOT_TOKEN)
+    await check_telethon_connection()
     rt = 0
     while rt < max_retries:
         try:
@@ -1879,10 +1905,8 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ Thank you to python-telegram-bot example chatmemberbot.py for the model of this function
         https://github.com/python-telegram-bot/python-telegram-bot/blob/master/examples/chatmemberbot.py
     """
-    global telethon
     global let_leave_without_banning
-    if telethon.is_connected() == False:
-        telethon.start(bot_token=BOT_TOKEN)
+    await check_telethon_connection()
    
     chat_id = update.effective_chat.id
     chat_name = update.effective_chat.title
@@ -1997,13 +2021,10 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Check if it's a media message (photo, video, etc.) and update user activity
 @authorized_chat_check
 async def handle_message(update: Update, context: CallbackContext): 
-    global telethon
-
     rt = 0
     while rt < max_retries:
         try:  
-            if telethon.is_connected() == False:
-                telethon.start(bot_token=BOT_TOKEN)
+            await check_telethon_connection()
             chat_type = update.effective_chat.type
             # Kickbot private chats do not process ordinary messages.
             if chat_type == ChatType.PRIVATE:
@@ -2124,9 +2145,7 @@ async def whitelist_user(update: Update, context: CallbackContext):
         )
         # Schedule a task to delete the message after 5 seconds
         asyncio.create_task(delete_message_after_delay(context, message))
-        global telethon
-        if telethon.is_connected() == False:
-            telethon.start(bot_token=BOT_TOKEN)
+        await check_telethon_connection()
         try:
             lookup_id = int(context.args[0])
         except:
@@ -2176,9 +2195,7 @@ async def dewhitelist_user(update: Update, context: CallbackContext):
         )
         # Schedule a task to delete the message after 5 seconds
         asyncio.create_task(delete_message_after_delay(context, message))
-        global telethon
-        if telethon.is_connected() == False:
-            telethon.start(bot_token=BOT_TOKEN)
+        await check_telethon_connection()
         user = await telethon.get_entity(context.args[0])
         user_id = user.id
         user_name = user.first_name + (" " + user.last_name if user.last_name else "")
@@ -2227,9 +2244,7 @@ async def show_whitelist(update: Update, context: CallbackContext):
             users_by_channel[channel_id].append(user_id)
 
         # Print the results
-        global telethon
-        if telethon.is_connected() == False:
-            telethon.start(bot_token=BOT_TOKEN)
+        await check_telethon_connection()
         for channel_id, user_ids in users_by_channel.items():
             chat_entity = await telethon.get_entity(channel_id)
             title=chat_entity.title
@@ -2334,9 +2349,7 @@ async def assemble_banned_list(chat_id, admin_ids, cutoff_date) -> [tuple]:
 
             if API_ID and API_HASH:
                 logging.warning(f"QUERYING ROOM MEMBERS.")
-                global telethon
-                if telethon.is_connected() == False:
-                    telethon.start(bot_token=BOT_TOKEN)
+                await check_telethon_connection()
                 async for user in telethon.iter_participants(chat_id):
                     user_id = user.id
                     user_name = f"{user.first_name}{' ' + user.last_name if user.last_name else ''}"
@@ -2681,6 +2694,65 @@ async def import_blacklist_callback_query_handler_loop(update: Update, context: 
     asyncio.create_task(import_blacklist_callback_query_handler(update, context))
     return
 
+# ********* STOP AND RESTART **********
+
+def stop_and_restart():
+    """Gracefully stop the Updater and replace the current process with a new one"""
+    app.stop()
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+@authorized_admin_check
+def restart(update, context):
+    update.message.reply_text('Bot is restarting...')
+    Thread(target=stop_and_restart).start()
+
+@authorized_admin_check
+async def restart_bot(update, context):
+    global app
+    try:
+        if update.effective_chat.type != ChatType.PRIVATE:
+            return
+        if update.effective_user.id not in [6862368034]:
+            return
+        await update.message.reply_text('Bot is restarting...')
+        await app.stop()
+        # Reinitialize components here (if feasible)
+        app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+        app.add_handler(CommandHandler("inactivekick", inactive_kick_loop))
+        app.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
+        app.add_handler(CommandHandler("quietkick", quiet_kick_loop))
+        app.add_handler(CommandHandler("inactiveban", inactive_ban_loop))
+        app.add_handler(CommandHandler("wl_add", whitelist_user_loop))
+        app.add_handler(CommandHandler("wl", show_whitelist_loop))
+        app.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
+        app.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
+        app.add_handler(CommandHandler("lurkinfo", lookup_loop))  
+        app.add_handler(CommandHandler("log", request_log_loop))     
+        app.add_handler(CommandHandler("gcstats", chat_status_loop)) 
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("cleandb", clean_database_loop)) 
+        app.add_handler(CommandHandler("test", update_chat_members))
+        app.add_handler(CommandHandler("track", start_chat_member_tracking))
+        app.add_handler(CommandHandler("stop", stop_chat_member_tracking))
+        app.add_handler(CommandHandler("wholeft", show_wholeft_loop))
+        app.add_handler(CommandHandler("noleavers", ban_leavers_mode_loop))
+        app.add_handler(CommandHandler("blacklist", get_blacklist_loop))
+        app.add_handler(CommandHandler("blban", ban_from_blacklist_loop))
+        app.add_handler(CommandHandler("forgive", unban_loop))
+        app.add_handler(CommandHandler("setbackup", set_backup_loop)) 
+        app.add_handler(CommandHandler("restart", restart_bot)) 
+        app.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
+        app.add_handler(CallbackQueryHandler(import_blacklist_callback_query_handler_loop, pattern='^blacklist_import_.*'))
+        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+        app.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
+        app.add_error_handler(error)
+        await app.run_polling()
+    except Exception as e:
+        logging.error(f"Failed to restart the bot: {e}")
+
+
+
 # ********* MAIN *********
 
 
@@ -2691,6 +2763,7 @@ async def post_init(application: Application):
 def main() -> None:
     """Run bot."""
     global kickbot
+    global app
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
@@ -2717,6 +2790,7 @@ def main() -> None:
     application.add_handler(CommandHandler("blban", ban_from_blacklist_loop))
     application.add_handler(CommandHandler("forgive", unban_loop))
     application.add_handler(CommandHandler("setbackup", set_backup_loop)) 
+    application.add_handler(CommandHandler("restart", restart_bot)) 
     application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
     application.add_handler(CallbackQueryHandler(import_blacklist_callback_query_handler_loop, pattern='^blacklist_import_.*'))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
@@ -2727,6 +2801,7 @@ def main() -> None:
     # Run the bot until the user presses Ctrl-C
     try:
         kickbot = application.bot
+        app = application
         if API_ID and API_HASH:
             global telethon
             telethon = TelegramClient('memberlist_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
