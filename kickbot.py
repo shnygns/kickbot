@@ -2343,7 +2343,7 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                 # Update the progress bar
                 pbar.update(1)    
 
-                logging.info(f"User ID {user_id} {'BANNED' if three_strikes_ban else 'KICKED'} from {issuer_chat_id} '{issuer_chat_name}' (kick # {kick_count+1}).")
+                logging.warning(f"User ID {user_id} {'BANNED' if three_strikes_ban else 'KICKED'} from {issuer_chat_id} '{issuer_chat_name}' (kick # {kick_count+1}).")
                 
                 with open('kick.log', 'a') as log_file:
                     log_file.write(f"User ID: {user_id}, Last Activity: {last_activity_readable}, Kick # {kick_count+1}{' (BANNED)' if three_strikes_ban else ''}.\n")
