@@ -2325,7 +2325,7 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                 three_strikes = False if kick_count < 2 else True
                 three_strikes_mode = get_three_strikes(issuer_chat_id)
                 three_strikes_ban = three_strikes_mode[0]==1 and three_strikes
-
+                action = 'ALLOWED TO REMAIN'
                 if not pretend:
                     # Increment the user's kick count in the database
                     insert_kicked_user_in_kick_db(user_id, issuer_chat_id, last_activity_str)
@@ -2333,17 +2333,26 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                     # If supergroup, use 'unban' for kick. Otherwise just ban.               
                     if (issuer_chat_type == ChatType.SUPERGROUP or issuer_chat_type == ChatType.CHANNEL) and not ban and not three_strikes_ban:
                         await context.bot.unban_chat_member(issuer_chat_id, user_id)
+                        action = 'KICKED'
                     else:
                         await context.bot.ban_chat_member(issuer_chat_id, user_id)
                         insert_kicked_user_in_blacklist(user_id, issuer_chat_id)
                         banned_uids.append(user_id)
+                        if three_strikes_ban:
+                            action = 'BANNED (THIRD STRIKE)'
+                        elif ban:
+                            action = 'BANNED (BAN PURGE)'
+                        else:
+                            action = 'BANNED (GROUP NOT SUPERGROUP OR CHANNEL)'
+                else:
+                    action = 'PRETEND-KICKED'
                     
                 banned_count += 1
                 
                 # Update the progress bar
                 pbar.update(1)    
 
-                logging.warning(f"User ID {user_id} {'BANNED' if three_strikes_ban else 'KICKED'} from {issuer_chat_id} '{issuer_chat_name}' (kick # {kick_count+1}).")
+                logging.warning(f"User ID {user_id} {action} from {issuer_chat_id} '{issuer_chat_name}' (kick # {kick_count+1}).")
                 
                 with open('kick.log', 'a') as log_file:
                     log_file.write(f"User ID: {user_id}, Last Activity: {last_activity_readable}, Kick # {kick_count+1}{' (BANNED)' if three_strikes_ban else ''}.\n")
