@@ -647,42 +647,26 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
         user_id_map = {}
 
         for user_id_to_be_verified in user_ids_not_in_iter_participants:
-            rt = 0
-            while rt < max_retries:
-                try:
-                    result = await kickbot.get_chat_member(chat_id, user_id_to_be_verified)
-                    result_user_id = result.user.id
-                except Exception:
-                    logging.warning(f"SCAN: get_chat_member() returned an exception for {result_user_id}: {result} - Retrying.")
-                    rt += 1
-                    if rt == 3:
-                        logging.warning(f"SCAN: get_chat_member() retries for {result_user_id} failed. {e}")
-            #tasks.append(task)
-            #user_id_map[task] = user_id_to_be_verified
+            try:
+                result = None
+                result_user_id = None
+                result = await kickbot.get_chat_member(chat_id, user_id_to_be_verified)
+                result_user_id = result.user.id
+            except Exception:
+                logging.warning(f"SCAN: During individual verifiction of left group members, get_chat_member() returned an exception for {user_id_to_be_verified}")
 
-        #verification_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        #for task, result in zip(tasks, verification_results):
+            if not result:
+                continue
 
-        
-            #result_user_id = user_id_map[task]
             group_member_dict =  lookup_group_member(result_user_id, chat_id)
-            group_member_dict = group_member_dict[0] if len(group_member_dict) > 0 else None
-            #if isinstance(result, Exception):
-            #    logging.warning(f"SCAN: get_chat_member() returned an exception for {result_user_id}: {result} - Retrying.")
-            #    retried_chat_member = None
-            #    try:
-            #        retried_chat_member = await kickbot.get_chat_member(chat_id, result_user_id)
-            #        logging.warning(f"SCAN: get_chat_member() retry for {result_user_id} succeeded.")
-            #    except Exception as e:
-            #        logging.warning(f"SCAN: get_chat_member() retry for {result_user_id} failed. {e}")
-            #    if retried_chat_member.status == 'left':
-            #        left_user_ids.add(result_user_id)
+            group_member_dict = group_member_dict[0] if group_member_dict else None
+
             if result.status in ["member", "administrator", "creator"]:
                 pass
             elif result.status == 'left':
                 left_user_ids.add(result_user_id)
-                logging.warning(f"SCAN: {group_member_dict.get('user_name')} ({result_user_id} - @{group_member_dict.get('username')}) has left {chat.title} --- DB status = {group_member_dict.get('status')}; Chat Member Lookup Status = {result.status}")
+                if group_member_dict:
+                    logging.warning(f"SCAN: {group_member_dict.get('user_name')} ({result_user_id} - @{group_member_dict.get('username')}) has left {chat.title} --- DB status = {group_member_dict.get('status')}; Chat Member Lookup Status = {result.status}")
             elif result.status == 'kicked':
                 batch_update_banned([result_user_id], chat_id)
             else:
@@ -770,8 +754,6 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
 
 
 async def uniban_from_list(user_id_list, add_to_bl = True, reason = ''):
-    async def ban_user(user_id, chat_id):
-        await kickbot.ban_chat_member(chat_id, user_id)
     chat_ids_in_database = list_chats_in_db()
     for chat_id in chat_ids_in_database:
         try:
@@ -785,21 +767,25 @@ async def uniban_from_list(user_id_list, add_to_bl = True, reason = ''):
                 logging.warning(f"Can't ban from {chat.title} - PRIVATE")
                 continue
 
-            logging.warning(f"Banning left users from {chat.title}")  
-            #await asyncio.gather(*(ban_user(user_id, chat_id) for user_id in user_id_list))           
+            logging.warning(f"Banning left users from {chat.title}")         
             for banning_user_id in user_id_list:
                 group_member_dict =  lookup_group_member(banning_user_id, chat_id)
-                group_member_dict = group_member_dict[0] if len(group_member_dict) > 0 else None
-                logging.warning(f"Banning {group_member_dict.get('user_name')} ({banning_user_id} - @{group_member_dict.get('user_name')} from {chat.title} --- {reason}")
-                await kickbot.ban_chat_member(chat_id, banning_user_id)
+                group_member_dict = group_member_dict[0] if group_member_dict else None
+                if group_member_dict:
+                    logging.warning(f"Banning {group_member_dict.get('user_name')} ({banning_user_id} - @{group_member_dict.get('username')} from {chat.title} --- {reason}")
+                try:
+                    await kickbot.ban_chat_member(chat_id, banning_user_id)
+                except Exception as e:
+                    logging.warning(f"Ban error for {banning_user_id} in {chat.title} - {e}")
             if add_to_bl:
                 insert_userlist_into_blacklist(user_id_list, chat_id)
 
         except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
-            logging.warning(f"Can't ban from {chat.title} - PRIVATE ERROR - May no longer be active")
+            logging.warning(f"Can't ban from {chat.title} - Bad request or private channel error")
             continue
         except Exception as e:
             logging.warning(f"Uniban error: {e}")
+            continue
     return
 
 async def ban_from_imported_blacklist(blacklist_data):
@@ -1191,7 +1177,9 @@ async def chat_status(update: Update, context: CallbackContext):
     posted_in_last_12_hours = 0
     not_posted = 0
 
-    if not context.args[0]:
+    if not context.args:
+        # No arguments passed
+        update.message.reply_text("No arguments provided.")
         return
 
     try:
@@ -1544,7 +1532,7 @@ async def find_inactive_chats():
                     if rt == max_retries:
                         logging.warning(f"Max retry limit reached. Chat {chat.title} not classified.")
                         maxed = True
-                        # "break" statement would be redundant here. Omitting.
+                        break
                 except (BadRequestError, BadRequest, Forbidden, ChannelPrivateError) as e:
                     # Expecting deleted chats to get this error
                     inactive_chats.append(chat_id)
