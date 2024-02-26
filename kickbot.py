@@ -1526,7 +1526,7 @@ async def find_inactive_chats():
                     # Expecting deleted chats to get this error
                     inactive_chats.append(chat_id)
                     inactive_str = inactive_str + f"{chat_id}\n"
-                    logging.warning(f"Bad Request occurred in chat {chat_id}: Possible that {chat.title} has nuked.")
+                    logging.warning(f"Bad Request occurred in chat {chat_id}: Possible that {chat.title if chat else 'chat'} has nuked.")
                     break
                 except (RetryAfter, TimedOut, NetworkError) as e:
                     exc_type, exc_value, exc_traceback = sys.exc_info()
@@ -1535,7 +1535,7 @@ async def find_inactive_chats():
                     await asyncio.sleep(wait_seconds)
                     rt += 1
                     if rt == max_retries:
-                        logging.warning(f"Max retry limit reached. Chat {chat.title} not classified.")
+                        logging.warning(f"Max retry limit reached. Chat {chat.title if chat else 'chat'} not classified.")
                         break
                 except Exception as e:
                     # Unknown exception, being conservative and not labeling as inactive.
