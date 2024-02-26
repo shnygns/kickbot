@@ -1006,7 +1006,7 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
                     insert_last_scan(results_chat_id)
             update_left_groups()
             let_leave_without_banning.clear()
-        logging.warning("SCAN Update completed.")
+        logging.warning("SCAN: Update completed.")
         return
 
     except Exception as e:
@@ -1512,7 +1512,7 @@ async def find_inactive_chats():
                 try:
                     chat = await kickbot.get_chat(chat_id)
                     #Use the authorization check as a way to update the chat name in the database
-                    is_chat_authorized(chat_id, chat.title)  
+                    #is_chat_authorized(chat_id, chat.title)  
                     if chat.type == ChatType.PRIVATE:
                         # if not a private bot chat:
                         inactive_chats.append(chat_id)
