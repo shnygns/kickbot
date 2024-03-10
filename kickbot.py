@@ -14,6 +14,9 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import asyncio
 import pytz
+import cProfile
+import io
+import pstats
 
 
 from config import (
@@ -87,7 +90,6 @@ import time
 from datetime import datetime, timedelta
 from functools import wraps
 from tqdm import tqdm
-from threading import Thread
 import aioschedule as schedule
 from telethon.sync import TelegramClient
 from telethon.errors import TakeoutInitDelayError, ChannelPrivateError, BadRequestError, UserAdminInvalidError
@@ -143,6 +145,8 @@ logging.getLogger().addHandler(console_handler)
 telethon = None
 kickbot = None
 app = None
+profiler = cProfile.Profile()
+kickbot_path = os.path.abspath(__file__)
 tracking_chat_members = True
 max_retries = 3
 authorized_chats = set()
@@ -641,10 +645,10 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
         user_ids_not_in_iter_participants = member_ids_in_db.union(unknown_status_in_db) - participant_user_ids # Members, Admins or 'Not Available's in DB minus current chat occupants = Left since last scan
 
 
-        # Step 5.5: Manually verify the status of every user not returned by iter_participants()     \
+        # Step 5.5: Manually verify the status of every user not returned by iter_participants()     
         left_user_ids = set()
-        tasks = []
-        user_id_map = {}
+
+
 
         for user_id_to_be_verified in user_ids_not_in_iter_participants:
             try:
@@ -652,9 +656,9 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
                 result_user_id = None
                 result = await kickbot.get_chat_member(chat_id, user_id_to_be_verified)
                 result_user_id = result.user.id
-            except Exception:
-                logging.warning(f"SCAN: During individual verifiction of left group members, get_chat_member() returned an exception for {user_id_to_be_verified}")
-
+            except Exception as e:
+                logging.warning(f"SCAN: Error verifying {user_id_to_be_verified} left {chat_id} - {e}")
+                batch_update_left([user_id_to_be_verified], chat_id)# UPDATE IN DB DIRECTLY WITHOUT FLAGGING AS A LEFT USER
             if not result:
                 continue
 
@@ -712,7 +716,7 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
                 async for participant in telethon.iter_participants(chat_id, filter = ChannelParticipantsKicked):     
                     if hasattr(participant, 'id') and isinstance(participant.id, int):
                         banned_user_ids.add(participant.id)
-            except AttributeError as e:
+            except (AttributeError, ValueError) as e:
                 logging.error(f" Error getting banned participant information during lookup: {e}")
                 # Remove the users already banned in the database, so as to only update those who were not banned before the scan.
             update_ban_status = banned_user_ids - banned_ids_in_db
@@ -736,20 +740,21 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
     except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError, NetworkError, RetryAfter) as e:
         logging.warning(f"Bot does not seem to have Admin rights in {chat.title} Chat processessing not completed.\n")
         scanning_underway.remove(chat_id)
-        return
+        return {}
     
     except (ConnectionRefusedError, ConnectionError) as e:
         logging.error(f"Connection to Telethon Bot interrupted. Chat processessing not completed.\n")
-        asyncio.sleep(5)
-        if not telethon.is_connected():
-            telethon.start(bot_token=BOT_TOKEN)
-        return
+        await asyncio.sleep(5)
+
+        scanning_underway.remove(chat_id)
+        return {}
     
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
         await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
         logging.error(f"Error in the process_chat_member_updates() function: {e}")
         scanning_underway.remove(chat_id)
+        return {}
     return results
 
 
@@ -921,6 +926,7 @@ async def unban(update: Update=None, context: CallbackContext=None):
 
 async def update_chat_members(update: Update=None, context: CallbackContext=None):
     global let_leave_without_banning
+    global scanning_underway
     try:
         chat_id = None
         active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
@@ -932,14 +938,22 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
             logging.warning("Inactive channels deleted.\n")
             logging.warning(active_str)  
 
-        #me = await telethon.get_me()
         i_am_admin = []
         active_ids = list_chats_in_db()      
         for chat_id in active_ids:
-            admins = await kickbot.get_chat_administrators(chat_id)
-            admin_ids = [admin.user.id for admin in admins]
-            if kickbot.id in admin_ids:
-                i_am_admin.append(chat_id)
+            try:
+                chat_member = await kickbot.get_chat_member(chat_id, kickbot.id)
+                if chat_member.status in ['administrator', 'creator']:
+                    i_am_admin.append(chat_id)
+                else:
+                    logging.info(f"Bot is not an admin in {chat_id}. Skipping scan.")
+            except BadRequest:
+                logging.error(f"Error setting up scan for {chat_id} - Bad Request error. Abandoning, and deleting from DB.")
+                del_chats_from_db([chat_id])
+                continue
+            except Exception:
+                logging.error(f"Error setting up scan for {chat_id} - Either not a member or couldn't retrieve admin list. Abandoning chat.")
+                continue
 
         if len(i_am_admin) > 0:
             # Create a list of tasks
@@ -947,21 +961,25 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
             tasks = [process_chat_member_updates(chat_id, update, context) for chat_id in i_am_admin]
 
             # Execute tasks concurrently using asyncio.gather()
-            results_list = await asyncio.gather(*tasks)
+            results_list = await asyncio.gather(*tasks, return_exceptions=True)
             shin_ids = set(keyword_search_from_db('shinanygans'))
             
 
             # Process obligation kicks in batch
-            if len(results_list)>0:
+            if results_list:
                 for results in results_list:
-                    try:
-                        results_chat_id = results['chat_id']
-                    except KeyError:
+                    if not results:
+                        continue
+                    if isinstance(results, Exception):
+                        logging.error(f"SCAN: An error occurred: {results}")
+                        continue
+                    if 'chat_id' not in results or 'joined_user_ids' not in results:
                         continue
                     try:
+                        results_chat_id = results.get('chat_id')
+                        results_joined_user_ids = results.get('joined_user_ids')
                         results_chat = await kickbot.get_chat(results_chat_id)  
                         results_chat_type = results_chat.type
-                        results_joined_user_ids = results['joined_user_ids']
                         admins = lookup_admin_ids(results_chat_id)
                         last_scan = lookup_last_scan(results_chat_id)
                         chat_name_dict = get_chat_ids_and_names()
@@ -991,7 +1009,7 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
                                                 joined_user_telethon = await telethon.get_entity(joined_user_id)
                                                 await obligation_kick(joined_user_id, results_chat_id, results_chat_type, joined_user_name, chat_name_dict.get(obligation_chat_id))
                                                 update_or_insert_chat_member(joined_user_telethon, results_chat_id, "last_kicked", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
-                                except Exception and e:
+                                except Exception as e:
                                     logging.warning(f"SCAN: Exception raised with joined user id {joined_user_id} - {e} while evaluating obligation kicks. Moving on to next joined user in list.")
                                     continue
                     except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
@@ -1006,6 +1024,7 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
                     insert_last_scan(results_chat_id)
             update_left_groups()
             let_leave_without_banning.clear()
+        scanning_underway.clear()
         logging.warning("SCAN: Update completed.")
         return
 
@@ -1013,6 +1032,7 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
         exc_type, exc_value, exc_traceback = sys.exc_info()
         await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
         logging.error(f"Error in the update_chat_members() function: {e}")
+        scanning_underway.clear()
         return
 
 
@@ -2055,6 +2075,8 @@ async def handle_message(update: Update, context: CallbackContext):
             chat_id = update.effective_message.chat_id
             chat_name = update.effective_chat.title
             user = update.effective_user
+            if user is None:
+                return
             user_id = user.id
             user_name = user.first_name + (" " + user.last_name if user.last_name else "")
 
@@ -2219,7 +2241,11 @@ async def dewhitelist_user(update: Update, context: CallbackContext):
         # Schedule a task to delete the message after 5 seconds
         asyncio.create_task(delete_message_after_delay(context, message))
         await check_telethon_connection()
-        user = await telethon.get_entity(context.args[0])
+        try:
+            lookup_id = int(context.args[0])
+        except:
+            lookup_id = context.args[0]
+        user = await telethon.get_entity(lookup_id)
         user_id = user.id
         user_name = user.first_name + (" " + user.last_name if user.last_name else "")
         delete_user_from_db(user_id, chat_id, "whitelist")
@@ -2231,7 +2257,7 @@ async def dewhitelist_user(update: Update, context: CallbackContext):
 
     except (IndexError, ValueError):
         await context.bot.send_message(chat_id=issuer_user_id, text="Invalid command format. Use /dewhitelist <user id or @ name> (e.g., /dewhitelist @username).")
-        logging.error(f"An error occurred in dewhitelist_user(), probably due to an invalid time argument.")
+        logging.error(f"An error occurred in dewhitelist_user(), probably due to an invalid argument.")
         
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
@@ -2246,12 +2272,15 @@ async def show_whitelist(update: Update, context: CallbackContext):
     chat_type = update.effective_chat.type
     try:
         if chat_type is not ChatType.PRIVATE:
-            message = await context.bot.send_message(
-                chat_id=chat_id,
-                text="<i style='color:#808080;'> Response will be sent privately.</i>",
-                parse_mode=ParseMode.HTML
-            )
-            asyncio.create_task(delete_message_after_delay(context, message))
+            try:
+                message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="<i style='color:#808080;'> Response will be sent privately.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                asyncio.create_task(delete_message_after_delay(context, message))
+            except Exception as e:
+                logging.error(f"Couldn't send message back to {chat_id} - {e}")
             whitelist_data = get_whitelist(chat_id)
         else:
             whitelist_data = get_whitelist_from_private()
@@ -2269,7 +2298,14 @@ async def show_whitelist(update: Update, context: CallbackContext):
         # Print the results
         await check_telethon_connection()
         for channel_id, user_ids in users_by_channel.items():
-            chat_entity = await telethon.get_entity(channel_id)
+            try:
+                chat_entity = await context.bot.get_chat(channel_id)
+            except BadRequest:
+                logging.error(f"Error in show_whitelist() getting chat {channel_id} - Bad Request error. Abandoning, and deleting from DB.")
+                del_chats_from_db([channel_id])
+            except Exception as e:
+                logging.error(f"Error in show_whitelist() getting chat {channel_id} ({e}) - Skipping.") #BUG delete chat if bad request/not found
+                continue
             title=chat_entity.title
             whitelist_message += f"{title.upper()}\n"
             for user_id in user_ids:
@@ -2361,7 +2397,7 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
     return banned_count
 
 
-async def assemble_banned_list(chat_id, admin_ids, cutoff_date) -> [tuple]:
+async def assemble_banned_list(chat_id, admin_ids, cutoff_date):
     users_to_ban = []
     banned_name_lookup = {}
     rt = 0
@@ -2444,6 +2480,7 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
     global kick_started
 
     if not update.message or kick_started == True:
+        logging.warning("Kick already started. Abandoning.")
         return
 
     kick_started = True
@@ -2590,6 +2627,45 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
     return
 
 
+async def print_profile_stats(update, context):
+    global profiler
+    try:
+        # Stop the profiler temporarily to generate stats
+        profiler.disable()
+        s = io.StringIO()
+        ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+        ps.print_stats(50)
+        
+
+        # Filtering and printing the stats
+        stats_message = ""
+        for func_info, func_stats in ps.stats.items():
+            func_path, line_no, func_name = func_info
+            func_path = os.path.abspath(func_path)
+
+            if func_path == kickbot_path:
+                total_calls, total_recursive_calls, total_time, cumulative_time, callers = func_stats
+                stats_message += f"{int(total_calls)} - {int(total_recursive_calls)} - {'{:.4f}'.format(total_time)} - {'{:.4f}'.format(cumulative_time)} - {next(iter(callers))[2]} - {next(iter(callers))[1]}\n"
+
+        # Calculate the number of parts the message would be split into
+        num_parts = len(stats_message) // 4096 + (1 if len(stats_message) % 4096 > 0 else 0)
+
+        if num_parts > 3:
+            await update.message.reply_text("Too much data to return. Please refine your request.")
+        else:
+            for i in range(0, len(stats_message), 4096):  # Telegram's max message length is 4096 chars
+                await update.message.reply_text(stats_message[i:i+4096])
+        
+        # Clear the StringIO buffer
+        s.close()
+
+        # Restart the profiler for continuous profiling
+        profiler.enable()
+    except Exception as e:
+        logging.warning(f"Error printing profilier stats: {e}")
+    return
+
+
 # ********* ASYNCIO TASK CREATION FUNCTIONS *********
 
 
@@ -2727,6 +2803,11 @@ async def import_blacklist_callback_query_handler_loop(update: Update, context: 
     asyncio.create_task(import_blacklist_callback_query_handler(update, context))
     return
 
+@authorized_admin_check
+async def profiler_loop(update: Update, context: CallbackContext):
+    asyncio.create_task(print_profile_stats(update, context))
+    return
+
 
 # ********* STOP AND RESTART **********
 
@@ -2760,6 +2841,8 @@ def main() -> None:
     """Run bot."""
     global kickbot
     global app
+    global profiler
+
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
@@ -2767,9 +2850,11 @@ def main() -> None:
     application.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
     application.add_handler(CommandHandler("quietkick", quiet_kick_loop))
     application.add_handler(CommandHandler("inactiveban", inactive_ban_loop))
+
     application.add_handler(CommandHandler("wl_add", whitelist_user_loop))
     application.add_handler(CommandHandler("wl", show_whitelist_loop))
     application.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
+
     application.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
     application.add_handler(CommandHandler("lurkinfo", lookup_loop))  
     application.add_handler(CommandHandler("log", request_log_loop))     
@@ -2789,6 +2874,8 @@ def main() -> None:
     application.add_handler(CommandHandler("restart", restart)) 
     application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
     application.add_handler(CallbackQueryHandler(import_blacklist_callback_query_handler_loop, pattern='^blacklist_import_.*'))
+
+    application.add_handler(CommandHandler("profiler", profiler_loop)) 
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
     application.add_error_handler(error)
@@ -2798,6 +2885,7 @@ def main() -> None:
     try:
         kickbot = application.bot
         app = application
+        profiler.enable()
         if API_ID and API_HASH:
             global telethon
             telethon = TelegramClient('memberlist_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
