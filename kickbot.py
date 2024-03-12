@@ -1978,8 +1978,9 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Convert user_data and admin_ids into sets for faster lookups
         whitelist_set = {entry[0] for entry in whitelist_data}
-        participant = await telethon.get_entity(user_id)
+        
         if not was_member and is_member:
+            participant = await telethon.get_entity(user_id)
             member_record_dict = lookup_group_member(user_id, chat_id)
             member_record_dict = member_record_dict[0] if len(member_record_dict) > 0 else None
             update_or_insert_chat_member(participant, chat_id, status='Member')
@@ -2013,6 +2014,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 logging.info(f"REALTIME: User ID {user_id} '{user_name}' entered chat {chat_id} '{chat_name}'. Admin. Ignoring.")
         if (not is_member and was_member) and user_id != context.bot.id and not kick_started:
+            participant = await telethon.get_entity(user_id)
             update_or_insert_chat_member(participant, chat_id, "last_left", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
             update_left_groups()
 
@@ -2062,9 +2064,11 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @authorized_chat_check
 async def handle_message(update: Update, context: CallbackContext): 
     rt = 0
+    await check_telethon_connection()
+    if not update.effective_chat or not update.effective_message or not update.effective_user:
+        return
     while rt < max_retries:
-        try:  
-            await check_telethon_connection()
+        try:          
             chat_type = update.effective_chat.type
             # Kickbot private chats do not process ordinary messages.
             if chat_type == ChatType.PRIVATE:
@@ -2075,8 +2079,6 @@ async def handle_message(update: Update, context: CallbackContext):
             chat_id = update.effective_message.chat_id
             chat_name = update.effective_chat.title
             user = update.effective_user
-            if user is None:
-                return
             user_id = user.id
             user_name = user.first_name + (" " + user.last_name if user.last_name else "")
 
@@ -2086,27 +2088,24 @@ async def handle_message(update: Update, context: CallbackContext):
             # If the message contained acceptable media, process further
             if update.effective_message.document or update.effective_message.photo or update.effective_message.video:
                 date = update.effective_message.date
+
                 chat_member = None
                 try:
                     chat_member = await context.bot.get_chat_member(chat_id, user_id)
                 except Exception as e:
-                    logging.warning(f"{e}")
-                    break
-                if not chat_member:
-                    break
-                async for participant in telethon.iter_participants(chat_id, search=user.first_name):
-                    if participant.id == user_id:
-                        update_or_insert_chat_member(participant, chat_id, "last_posted", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
-
+                    logging.error(f"Exception in handle_message() looking up chat member: {e}. Proceeding as if not an admin.")
                 # If the sender was not an admin, update the last_activity in the database
-                if not chat_member.status in ["administrator", "creator"]:
+                if not chat_member or chat_member.status not in ["administrator", "creator"]:
                     logging.warning(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' *POSTED MEDIA*")
-                    await debug_message(context, chat_id, user_name, DEBUG_UPDATE_MESSAGE)
                     update_user_activity(user_id, chat_id, date)
 
                 else:
                     logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' contains acceptable media but is an admin. Ignoring.")
-                    await debug_message(context, chat_id, user_name, DEBUG_ADMIN_MESSAGE)
+                
+                # Get the telethon chat member information in order to update the internal member database.
+                async for participant in telethon.iter_participants(chat_id, search=user.first_name):
+                    if participant.id == user_id:
+                        update_or_insert_chat_member(participant, chat_id, "last_posted", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
             break
 
         except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
@@ -2115,8 +2114,6 @@ async def handle_message(update: Update, context: CallbackContext):
 
         except (RetryAfter, TimedOut, TimeoutError, NetworkError) as e:
             wait_seconds = e.retry_after if hasattr(e, 'retry_after') else 3
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
             logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
             await asyncio.sleep(wait_seconds)
             rt += 1
@@ -2376,7 +2373,7 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                 with open('kick.log', 'a') as log_file:
                     log_file.write(f"User ID: {user_id}, Last Activity: {last_activity_readable}, Kick # {kick_count+1}{' (BANNED)' if three_strikes_ban else ''}.\n")
                 break
-            except (RetryAfter, TimedOut) as e:
+            except (RetryAfter, TimedOut, NetworkError) as e:
                 wait_seconds = e.retry_after if hasattr(e, 'retry_after') else 3
                 logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
                 await asyncio.sleep(wait_seconds)
