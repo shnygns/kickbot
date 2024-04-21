@@ -21,6 +21,8 @@ telethon = "==1.30.3"
 tqdm = "==4.66.1"
 aioschedule = "*"
 tabulate = "*"
+pytest = "*"
+pytest-asyncio = "*"
 
 [dev-packages]
 

@@ -14,9 +14,8 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import asyncio
 import pytz
-import cProfile
-import io
-import pstats
+import time
+import traceback 
 
 
 from config import (
@@ -24,8 +23,6 @@ from config import (
     API_ID,
     API_HASH,
     DEBUG_CHATS,
-    DEBUG_ADMIN_MESSAGE,
-    DEBUG_UPDATE_MESSAGE,
     START_PURGE,
     HELP_MESSAGE,
     AUTHORIZED_ADMINS,
@@ -43,35 +40,30 @@ from db_utils import (
     deleted_kicks_from_user_activity,
     lookup_group_member,
     lookup_active_group_member,
-    lookup_admin_ids,
     lookup_user_in_kick_db,
     lookup_kick_count_in_kick_db,
     insert_kicked_user_in_kick_db,
+    lookup_most_recent_kick_timestamp,
     get_whitelist,
     get_whitelist_from_private,
     is_chat_authorized,
     insert_authorized_chat,
-    delete_authorized_chat,
     get_three_strikes,
     update_three_strikes,
     get_ban_leavers_status,
     update_ban_leavers_status,
-    insert_chat_member,
-    batch_update_db,
     batch_update_joined,
     batch_update_left,
     batch_update_kicked,
     batch_update_banned,
     list_member_ids_in_db,
     list_unkonwn_status_in_db,
-    list_kicked_users_in_db,
     list_banned_users_in_db,
     keyword_search_from_db,
     return_blacklist,
     get_wholeft,
     get_wholeft_from_private,
     update_left_groups,
-    update_or_insert_chat_member,
     insert_kicked_user_in_blacklist,
     insert_userlist_into_blacklist,
     remove_unbanned_user_from_blacklist,
@@ -84,18 +76,21 @@ from db_utils import (
     lookup_obligation_chat,
     lookup_last_scan,
     insert_last_scan,
-    import_blacklist_from_csv
+    import_blacklist_from_csv,
+    update_or_insert_group_member,
+    insert_last_admin_update,
+    lookup_last_admin_update,
+    EventType
 )
-import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from random import choice
 from functools import wraps
 from tqdm import tqdm
 import aioschedule as schedule
 from telethon.sync import TelegramClient
-from telethon.errors import TakeoutInitDelayError, ChannelPrivateError, BadRequestError, UserAdminInvalidError
+from telethon.errors import ChannelPrivateError, BadRequestError, UserAdminInvalidError, TimedOutError
 from telethon.tl.types import (
     ChannelParticipantAdmin, 
-    ChannelParticipantsAdmins,
     ChannelParticipant, 
     ChannelParticipantCreator,
     ChatParticipant, 
@@ -110,8 +105,8 @@ from telegram.error import RetryAfter, Forbidden, TimedOut, BadRequest, NetworkE
 from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
-    ContextTypes,
     CallbackQueryHandler,
+    ContextTypes,
     MessageHandler,
     filters,
     CallbackContext,
@@ -145,7 +140,6 @@ logging.getLogger().addHandler(console_handler)
 telethon = None
 kickbot = None
 app = None
-profiler = cProfile.Profile()
 kickbot_path = os.path.abspath(__file__)
 tracking_chat_members = True
 max_retries = 3
@@ -160,6 +154,68 @@ attempting_telethon_restart = False
 # Initialize the SQLite database
 initialize_db()
 
+# ********* LOCAL CACHING *********
+
+chat_admins_cache = {}
+
+async def update_chat_admins_cache(chat_id):
+    global chat_admins_cache
+    rt = 0
+    while rt < max_retries:
+        try:
+            chat_admins = await kickbot.get_chat_administrators(chat_id)
+            admin_ids = {admin.user.id for admin in chat_admins}
+            chat_admins_cache[chat_id] = admin_ids
+            insert_last_admin_update(chat_id)
+            break
+
+        except (BadRequest, Forbidden) as e:
+            # Expecting deleted chats to get this error
+            logging.warning(f"Bad Request occurred in chat {chat_id}: Deleting from database.")
+            del_chats_from_db([chat_id])
+            break
+        except (RetryAfter, TimedOut, NetworkError) as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            wait_seconds = 2 * e.retry_after if hasattr(e, 'retry_after') else 3
+            logging.warning(f"Error in update_chat_admins_cache() - {e}.  Line: {exc_traceback.tb_lineno} - Type: {exc_type}. Waiting for {wait_seconds} seconds...")
+            await asyncio.sleep(wait_seconds)
+            rt += 1
+            if rt == max_retries:
+                logging.warning(f"Max retry limit reached. Admins for {chat_id} not locally cached.")
+                break
+        except Exception as e:
+            logging.warning(f"Unhandled exception occurred in chat {chat_id}: {e}")
+            break
+    return
+
+async def is_user_admin(user_id, chat_id):
+    # If the chat's admins are not cached or if cache is deemed outdated, update it
+    if chat_id not in chat_admins_cache:
+        await update_chat_admins_cache(chat_id)
+    
+    # Now, check if the user is an admin
+    return user_id in chat_admins_cache.get(chat_id, set())
+
+
+async def authorize_chat_and_update_cache(chat_id, chat_title):
+    try:
+        admins = await kickbot.get_chat_administrators(chat_id)
+        admin_ids = {admin.user.id for admin in admins}
+        bot_admins = set(AUTHORIZED_ADMINS)
+
+        # Check for overlap between chat admins and AUTHORIZED_ADMINS
+        if admin_ids.intersection(bot_admins):
+            # Update cache and database as necessary
+            chat_admins_cache[chat_id] = admin_ids
+            insert_last_admin_update(chat_id)  # Update the last admin update timestamp in the database
+            if not is_chat_authorized(chat_id, chat_title):
+                insert_authorized_chat(chat_id, chat_title)  # Insert the chat into the database if not already present
+            return True
+    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError):
+        logging.error(f"Access error for chat {chat_id} - {chat_title}.")
+    except Exception as e:
+        logging.error(f"Unexpected error while authorizing chat {chat_id}: {e}")
+    return False
 
 # ********* WRAPPERS *********
 
@@ -168,29 +224,18 @@ initialize_db()
 def authorized_admin_check(handler_function):
     @wraps(handler_function)
     async def wrapper(update: Update, context: CallbackContext):
-        rt = 0
-        while rt < max_retries:
-            try:
-                user_id = update.effective_user.id
-                if AUTHORIZED_ADMINS and user_id not in AUTHORIZED_ADMINS:
-                    return 
-                else:
-                    return await handler_function(update, context)
-            except RetryAfter as e:
-                wait_seconds = e.retry_after
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-                logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
-                await asyncio.sleep(wait_seconds)
-                rt += 1
-                if rt == max_retries:
-                    logging.warning(f"Max retry limit reached. Message not sent.")
-                    raise e
-            except Exception as e:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-                logging.warning(f"An error occured in authorized_admin_check(): {e}")
-                return
+        try:
+            user_id = update.effective_user.id
+            if AUTHORIZED_ADMINS and user_id not in AUTHORIZED_ADMINS:
+                return 
+            else:
+                return await handler_function(update, context)
+
+        except Exception as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
+            logging.warning(f"An error occured in authorized_admin_check(): {e}")
+            return
     return wrapper
 
 
@@ -240,6 +285,8 @@ def authorized_chat_check(handler_function):
                 set_auth_admins = set(AUTHORIZED_ADMINS)
                 if set_auth_admins.intersection(set_admin_ids):
                     insert_authorized_chat(chat_id, chat_title)
+                    chat_admins_cache[chat_id] = set_admin_ids # Cache admin ids from chat
+                    insert_last_admin_update(chat_id) # Update most recent admin lookup
                     return await handler_function(update, context, *args, **kwargs)
                 else:
                     return 
@@ -260,82 +307,59 @@ def authorized_chat_check(handler_function):
                 return
     return wrapper
 
-
-# Custom decorator function to check if a chat is authorized (use for room data collection).
 def is_admin_of_authorized_chat_check(handler_function):
     @wraps(handler_function)
     async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
-
-        # If the chat is private, it is authorized. Check passed.
         chat_type = update.effective_chat.type
-        if chat_type == ChatType.PRIVATE:
-            return await handler_function(update, context, *args, **kwargs)
-        
-        # If no authorized admins are in the list, the bot is open. Check passed.
-        if not AUTHORIZED_ADMINS:
-            return await handler_function(update, context, *args, **kwargs)
-        
-        # If the command issuer is a named admin on the bot, they are authorized. Check passed.
-        user_id = update.effective_user.id
-        if user_id in AUTHORIZED_ADMINS:
-            return await handler_function(update, context)
-        
-        # Check if the chat is authorized based on the SQLite table
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         chat_title = update.effective_chat.title
-        
-        # Get the chat admins and see if there's a match to the issuing user id.
-        rt = 0
-        while rt < max_retries:
-            try:      
-                admins = await update.effective_chat.get_administrators()
-            
-            except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
-                logging.error(f"An access error occured in authorized_chat_check() for {chat_id} - {chat_title}. Cleaning databases.")
-                active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
-                if len(inactive_chats) > 0:
-                    logging.warning("Found inactive chats. Cleaning database.\n")
-                    logging.warning(inactive_str)
-                    del_chats_from_db(inactive_chats)
-                    logging.warning("Purging...\n")
-                    logging.warning("Inactive channels deleted.\n")
-                    logging.warning(active_str)  
-                return
-            
-            except Exception:
-                return
 
+        # Pass directly for private chats or if the user is an authorized admin
+        if chat_type == ChatType.PRIVATE or user_id in AUTHORIZED_ADMINS:
+            return await handler_function(update, context, *args, **kwargs)
+
+        # Function to attempt to authorize chat and handle common exceptions
+        
+        async def attempt_authorize_and_execute():
             try:
-                admin_ids = {admin.user.id for admin in admins}
-                set_admin_ids = set(admin_ids)
-                set_auth_admins = set(AUTHORIZED_ADMINS)
-                if set_auth_admins.intersection(set_admin_ids):
-                    if user_id in admin_ids:
-                        return await handler_function(update, context, *args, **kwargs)                  
-                    else:
-                        return 
-                else:
-                    return 
-            except RetryAfter as e:
-                wait_seconds = e.retry_after
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-                logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
-                await asyncio.sleep(wait_seconds)
-                rt += 1
-                if rt == max_retries:
-                    logging.warning(f"Max retry limit reached. Message not sent.")
-                    return
+                # Runs get_chat_administrators()...if named bot admin is also chat admin, insert into cache and insert into DB as necessary
+                if await authorize_chat_and_update_cache(chat_id, chat_title) and await is_user_admin(user_id, chat_id): #Reauthorize success and user is admin
+                    return await handler_function(update, context, *args, **kwargs)
+            except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError):
+                await handle_inactive_chats()
             except Exception as e:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-                logging.warning(f"An error occured in authorized_chat_check(): {e}")
-                return
+                logging.error(f"An unexpected error occurred: {e}")
+            return
+
+        # Main authorization logic
+        if chat_id in chat_admins_cache:
+            # Cached chat: Check if the user is an admin directly
+            if await is_user_admin(user_id, chat_id):
+                return await handler_function(update, context, *args, **kwargs)
+            else:
+                # Attempt to re-authorize the chat if the user was expected to be an admin
+                return await attempt_authorize_and_execute()
+        else:
+            # Chat not in cache: Attempt to authorize and update cache
+            return await attempt_authorize_and_execute()
+
     return wrapper
 
 
 # ********* UTILITIES *********
+
+async def handle_inactive_chats():
+    active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
+    if len(inactive_chats) > 0:
+        logging.warning("Found inactive chats. Cleaning database.\n")
+        logging.warning(inactive_str)
+        del_chats_from_db(inactive_chats)
+        logging.warning("Purging...\n")
+        logging.warning("Inactive channels deleted.\n")
+        logging.warning(active_str)      
+    return
+
 
 async def check_telethon_connection() -> bool:
     global telethon
@@ -362,7 +386,7 @@ async def check_telethon_connection() -> bool:
     attempting_telethon_restart = False
     return telethon.is_connected
 
-
+'''
 # Validate format of blacklist CSV imports
 def validate_csv_format(csv_filename):
     try:
@@ -409,29 +433,12 @@ async def handle_blacklist_import(update: Update, context: ContextTypes.DEFAULT_
             text="<i style='color:#808080;'> Please open a chat with the bot to see responses.</i>",
             parse_mode=ParseMode.HTML
         )
-
-
-
+'''
 
 # Registered error handler for the app
 async def error(update, context):
     err = f"Update: {update}\nError: {context.error}"
     logging.error(err, exc_info=context.error)
-    return
-
-
-async def suspend_scanning():
-    if not tracking_chat_members:
-        return
-    global scanning_underway
-    logging.warning("Suspending timed chat tracking.")
-    schedule.clear()
-    while kick_started:
-        await asyncio.sleep(1)
-    schedule.every(3).minutes.do(update_chat_members)
-
-    logging.warning("Timed chat tracking re-started.")
-
     return
 
 
@@ -534,275 +541,59 @@ def calculate_cutoff_date(arg):
     return cutoff_date, readable_string_of_duration
 
 
-async def process_chat_member_updates(chat_id, update: Update=None, context: CallbackContext=None):
-    try:
-        await check_telethon_connection()
-        global scanning_underway
-        scanning_underway.append(chat_id)
-        try:
-            chat = await kickbot.get_chat(chat_id)
-        except Exception as e:
-            logging.error(f"Error in process_chat_member_updates() - {e}")
-            return {}
-        # chat_name_dict = get_chat_ids_and_names()
-        admin_ids = lookup_admin_ids(chat_id)
-        shin_ids = set(keyword_search_from_db('shinanygans'))
-        whitelist_data = get_whitelist(chat_id)
-
-        # Convert user_data and admin_ids into sets for faster lookups
-        whitelist_set = {entry[0] for entry in whitelist_data}
-
-        # Step 1: Fetch the list of user_ids from the chat_member table for the given chat_id
-        member_ids_in_db = set(list_member_ids_in_db(chat_id)) # Users who are currently 'Member' or 'Admin' of 'Creator' status
-        unknown_status_in_db = set(list_unkonwn_status_in_db(chat_id))
-        banned_ids_in_db = set(list_banned_users_in_db(chat_id)) # Users who are currently 'Banned' status
-        is_supergroup = True if chat.type == ChatType.SUPERGROUP or chat.type == ChatType.CHANNEL else False
-
-        # Step 2: Initialize set for tracking current participant user_ids
-        participant_user_ids = set()
-        participant_dict = {}
-
-        # Step 3: Iterate through the participants returned by iter_participants
-        logging.warning(f"Cataloging members of {chat_id}")
-        batch_insert_parameters = []
-        member_previous_status = {}
-        async for participant in telethon.iter_participants(chat_id):
-            user_id = participant.id
-            member_record_dict = lookup_group_member(user_id, chat_id)
-            member_record_dict = member_record_dict[0] if len(member_record_dict) > 0 else None
-            member_previous_status[user_id] = member_record_dict.get('status') if member_record_dict else 'N/A'
-            if not hasattr(participant, 'participant'):
-                user_status = 'Not Available'
-            elif isinstance(participant.participant, ChannelParticipantAdmin):
-                user_status = 'Admin'
-            elif isinstance(participant.participant, ChannelParticipantCreator):
-                user_status = 'Creator'
-            elif isinstance(participant.participant, ChannelParticipant):
-                user_status = 'Member'
-            elif isinstance(participant.participant, ChatParticipantAdmin):
-                user_status = 'Admin'
-            elif isinstance(participant.participant, ChatParticipantCreator):
-                user_status = 'Creator'
-            elif isinstance(participant.participant, ChatParticipant):
-                user_status = 'Member'
-            elif isinstance(participant.participant, ChannelParticipantBanned):
-                user_status = 'Banned'      
-            else:
-                user_status = 'Not Available'
-
-            # Step 4: Update the chat_member data
-            batch_insert_parameters.append((
-                user_id,
-                chat_id,
-                f"{participant.first_name}{' ' + participant.last_name if participant.last_name else ''}",
-                participant.username,
-                participant.premium,
-                participant.verified,
-                participant.bot,
-                participant.fake,
-                participant.scam,
-                participant.restricted,
-                participant.restriction_reason if participant.restriction_reason else None,
-                user_status,
-                user_id,
-                chat_id,
-                participant.participant.date.strftime("%Y-%m-%d %H:%M:%S.%f") if hasattr(participant.participant, 'date') else None,
-                participant.participant.date.strftime("%Y-%m-%d %H:%M:%S.%f") if hasattr(participant.participant, 'date') else None,
-                #last_left
-                user_id,
-                chat_id,
-                #last_kicked
-                user_id,
-                chat_id,
-                #last_posted
-                user_id,
-                chat_id,
-                #last_banned
-                user_id,
-                chat_id,
-                #times_joined
-                user_id,
-                chat_id,
-                #times_posted
-                user_id,
-                chat_id, 
-                #times_left
-                user_id,
-                chat_id, 
-                #times_kicked
-                user_id,
-                chat_id,
-                #times_banned
-                user_id,
-                chat_id
-            ))
-            if user_status != 'Banned':
-                participant_user_ids.add(user_id)
-            participant_dict[user_id] = user_status
-        batch_insert_or_update_chat_member(batch_insert_parameters)
-
-        # Step 5: Identify users that have left or joined, or who were previously banned
-        user_ids_not_in_iter_participants = member_ids_in_db.union(unknown_status_in_db) - participant_user_ids # Members, Admins or 'Not Available's in DB minus current chat occupants = Left since last scan
-
-
-        # Step 5.5: Manually verify the status of every user not returned by iter_participants()     
-        left_user_ids = set()
-
-
-
-        for user_id_to_be_verified in user_ids_not_in_iter_participants:
-            try:
-                result = None
-                result_user_id = None
-                result = await kickbot.get_chat_member(chat_id, user_id_to_be_verified)
-                result_user_id = result.user.id
-            except Exception as e:
-                logging.warning(f"SCAN: Error verifying {user_id_to_be_verified} left {chat_id} - {e}")
-                batch_update_left([user_id_to_be_verified], chat_id)# UPDATE IN DB DIRECTLY WITHOUT FLAGGING AS A LEFT USER
-            if not result:
-                continue
-
-            group_member_dict =  lookup_group_member(result_user_id, chat_id)
-            group_member_dict = group_member_dict[0] if group_member_dict else None
-
-            if result.status in ["member", "administrator", "creator"]:
-                pass
-            elif result.status == 'left':
-                left_user_ids.add(result_user_id)
-                #if group_member_dict:
-                #    logging.warning(f"SCAN: {group_member_dict.get('user_name')} ({result_user_id} - @{group_member_dict.get('username')}) has left {chat.title} --- DB status = {group_member_dict.get('status')}; Chat Member Lookup Status = {result.status}")
-            elif result.status == 'kicked':
-                batch_update_banned([result_user_id], chat_id)
-            else:
-                pass
-        logging.warning(f"SCAN: {len(left_user_ids)} users are verified to have left {chat.title}.")
-        joined_user_ids = participant_user_ids - member_ids_in_db.union(unknown_status_in_db) # Current chat occupants minus Members/Admins/Not Available in DB = Net new + rejoins and unbanned
-        unbanned_user_ids = joined_user_ids.intersection(banned_ids_in_db) # Currently banned in the DB but rejoined the group
-        user_ids_to_ban = left_user_ids - admin_ids - let_leave_without_banning - shin_ids - whitelist_set
-        results = {'chat_id': chat_id, 'joined_user_ids': joined_user_ids}
-        
-        logging.warning(f"SCAN: {chat_id} ({chat.title}) -- Kickbot scan found {len(joined_user_ids)} new users.")
-
-        # Step 6: Batch update the database for users that have left
-        
-        batch_update_joined(joined_user_ids, chat_id)
-        batch_update_left(left_user_ids, chat_id)
-        remove_unbanned_user_from_blacklist(unbanned_user_ids, chat_id)
-
-        ban_leavers_mode = get_ban_leavers_status(chat_id)
-        #If ban_leavers_mode is on, ban anyone with a status of "left"
-        if ban_leavers_mode[0]==1:
-            last_scan = lookup_last_scan(chat_id)
-            suspend_banning = (not last_scan) or (last_scan and (datetime.utcnow().replace(tzinfo=utc_timezone) - last_scan) > timedelta(minutes=10))
-            
-            if len(user_ids_to_ban) > 0:
-                if not suspend_banning:
-                    logging.warning(f"BAN-LEAVERS MODE ON FOR {chat_id} - THE FOLLOWING {len(user_ids_to_ban)} USERS WILL BE BANNED:")
-                    logging.warning(user_ids_to_ban)
-                    await uniban_from_list(user_ids_to_ban, reason = f'SCAN - LEFT {chat.title} WHILE NO-LEAVERS MODE ON')
-                else:
-                    logging.warning(f"BAN-LEAVERS MODE ON FOR {chat_id} - NO SCAN IN LAST 10 MINUTES - BANNING SUSPENDED.")
-
-
-            for joined_user_id in joined_user_ids:
-                if (joined_user_id, chat_id) in let_leave_without_banning:
-                    let_leave_without_banning.discard((joined_user_id, chat_id))
-        
-        if is_supergroup:
-
-            # Get total list of banned users, including any that were just banned by activating banned_leavers mode.
-            banned_user_ids = set()
-            try:
-                async for participant in telethon.iter_participants(chat_id, filter = ChannelParticipantsKicked):     
-                    if hasattr(participant, 'id') and isinstance(participant.id, int):
-                        banned_user_ids.add(participant.id)
-            except (AttributeError, ValueError) as e:
-                logging.error(f" Error getting banned participant information during lookup: {e}")
-                # Remove the users already banned in the database, so as to only update those who were not banned before the scan.
-            update_ban_status = banned_user_ids - banned_ids_in_db
-
-            # Set status, last_banned, and times_banned fields for those just banned
-            batch_update_banned(update_ban_status, chat_id)
-
-            # Arrive at a list of manually-unbanned users by subtracting currently banned users from those marked as banned in the DB.
-            manually_unbanned =  banned_ids_in_db - banned_user_ids
-            remove_unbanned_user_from_blacklist(manually_unbanned, chat_id)
-            batch_update_left(manually_unbanned, chat_id)
-
-
-        else:
-            if ban_leavers_mode[0]==1 and context and len(left_user_ids) > 0:
-                # Set status, last_banned, and times_banned fields for those just banned
-                batch_update_banned(user_ids_to_ban, chat_id)   
-        scanning_underway.remove(chat_id)
-        print(f"Update of {chat_id} completed.")
-    
-    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError, NetworkError, RetryAfter) as e:
-        logging.warning(f"Bot does not seem to have Admin rights in {chat.title} Chat processessing not completed.\n")
-        scanning_underway.remove(chat_id)
-        return {}
-    
-    except (ConnectionRefusedError, ConnectionError) as e:
-        logging.error(f"Connection to Telethon Bot interrupted. Chat processessing not completed.\n")
-        await asyncio.sleep(5)
-
-        scanning_underway.remove(chat_id)
-        return {}
-    
-    except Exception as e:
-        exc_type, exc_value, exc_traceback = sys.exc_info()
-        await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-        logging.error(f"Error in the process_chat_member_updates() function: {e}")
-        scanning_underway.remove(chat_id)
-        return {}
-    return results
-
+# ********* BANNING AND UNBANNING UTILITIES *********
 
 async def uniban_from_list(user_id_list, add_to_bl = True, reason = ''):
     chat_ids_in_database = list_chats_in_db()
     for chat_id in chat_ids_in_database:
         try:
-            admins = await kickbot.get_chat_administrators(chat_id)
-            admin_ids = [admin.user.id for admin in admins]
-            if kickbot.id not in admin_ids:
-                continue
-        
+            admins = chat_admins_cache.get(chat_id)
+            titles = get_chat_ids_and_names()
+            chat_title = titles.get(chat_id)
+            if not admins:
+                await authorize_chat_and_update_cache(chat_id, chat_title)
+            if not await is_user_admin(kickbot.id, chat_id):
+                continue         
+
             chat = await kickbot.get_chat(chat_id)
             if chat.type == ChatType.PRIVATE:
-                logging.warning(f"Can't ban from {chat.title} - PRIVATE")
+                logging.warning(f"Can't ban from {chat_title} - PRIVATE")
                 continue
 
-            logging.warning(f"Banning left users from {chat.title}")         
+            logging.warning(f"Banning left users from {chat_title}")         
             for banning_user_id in user_id_list:
                 group_member_dict =  lookup_group_member(banning_user_id, chat_id)
                 group_member_dict = group_member_dict[0] if group_member_dict else None
                 if group_member_dict:
-                    logging.warning(f"Banning {group_member_dict.get('user_name')} ({banning_user_id} - @{group_member_dict.get('username')} from {chat.title} --- {reason}")
+                    logging.warning(f"Banning {group_member_dict.get('user_name')} ({banning_user_id} - @{group_member_dict.get('username')} from {chat_title} --- {reason}")
                 try:
                     await kickbot.ban_chat_member(chat_id, banning_user_id)
                 except Exception as e:
-                    logging.warning(f"Ban error for {banning_user_id} in {chat.title} - {e}")
-            if add_to_bl:
-                insert_userlist_into_blacklist(user_id_list, chat_id)
+                    logging.warning(f"Ban error for {banning_user_id} in {chat_title} - {e}")
+            #if add_to_bl:
+            #    insert_userlist_into_blacklist(user_id_list, chat_id)
 
         except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
-            logging.warning(f"Can't ban from {chat.title} - Bad request or private channel error")
+            logging.warning(f"Can't ban from {chat_title} - Bad request or private channel error")
             continue
         except Exception as e:
             logging.warning(f"Uniban error: {e}")
             continue
     return
-
+'''
 async def ban_from_imported_blacklist(blacklist_data):
     async def ban_user(user_id, chat_id):
         await telethon.edit_permissions(chat_id, user_id, view_messages=False)
     chat_ids_in_database = list_chats_in_db()
     for chat_id in chat_ids_in_database:
         try:
-            admins = await kickbot.get_chat_administrators(chat_id)
-            admin_ids = [admin.user.id for admin in admins]
-            if kickbot.id not in admin_ids:
-                continue
+            admins = chat_admins_cache.get(chat_id)
+            titles = get_chat_ids_and_names()
+            chat_title = titles.get(chat_id)
+            if not admins:
+                await authorize_chat_and_update_cache(chat_id, chat_title)
+            if not await is_user_admin(kickbot.id, chat_id):
+                continue         
         
             chat = await kickbot.get_chat(chat_id)
             banned_users_for_this_chat = [blacklister[0] for blacklister in blacklist_data if blacklister[1] == chat_id]
@@ -819,14 +610,14 @@ async def ban_from_imported_blacklist(blacklist_data):
             logging.warning(f"Ban-from-imported-blacklist error: {e}")
     return
 
-
+'''
 async def unban(update: Update=None, context: CallbackContext=None):
     @authorized_admin_check
     async def universal_unban(update: Update=None, context: CallbackContext=None):
         chat_ids_in_database = list_chats_in_db()
         for chat_id in chat_ids_in_database:
             try:
-                remove_unbanned_user_from_blacklist(unban_user_list, chat_id)
+                # remove_unbanned_user_from_blacklist(unban_user_list, chat_id)
                 chat = await telethon.get_entity(chat_id)
                 if hasattr(chat, 'username') and chat.username:
                     logging.warning(f"Can't unban from {chat.title} - PRIVATE")
@@ -840,7 +631,7 @@ async def unban(update: Update=None, context: CallbackContext=None):
                 logging.warning(f"Unban error: {e}")       
     async def unban_from_current_chat():
         try:
-            remove_unbanned_user_from_blacklist(unban_user_list, issuer_chat_id)
+            # remove_unbanned_user_from_blacklist(unban_user_list, issuer_chat_id)
             chat = await telethon.get_entity(issuer_chat_id)
             if hasattr(chat, 'username') and chat.username:
                 logging.warning(f"Can't unban from {chat.title} - PRIVATE")
@@ -924,47 +715,49 @@ async def unban(update: Update=None, context: CallbackContext=None):
     return
 
 
+# ********* PERIODIC CHAT SCANNER *********
+
 async def update_chat_members(update: Update=None, context: CallbackContext=None):
     global let_leave_without_banning
     global scanning_underway
     try:
-        chat_id = None
-        active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
-        if len(inactive_chats) > 0:
-            logging.warning("Found inactive chats. Cleaning database.\n")
-            logging.warning(inactive_str)
-            del_chats_from_db(inactive_chats)
-            logging.warning("Purging...\n")
-            logging.warning("Inactive channels deleted.\n")
-            logging.warning(active_str)  
+        # First, clean all the inactive chats out of the database
+        await handle_inactive_chats()
 
+        # Assemble a list of active chats in which the kickbot is an admin
         i_am_admin = []
-        active_ids = list_chats_in_db()      
-        for chat_id in active_ids:
+        outdated_admin_lookups = []
+        active_ids = list_chats_in_db()     
+        chat_id = None
+        
+        for active_id in active_ids:
             try:
-                chat_member = await kickbot.get_chat_member(chat_id, kickbot.id)
-                if chat_member.status in ['administrator', 'creator']:
-                    i_am_admin.append(chat_id)
-                else:
-                    logging.info(f"Bot is not an admin in {chat_id}. Skipping scan.")
-            except BadRequest:
-                logging.error(f"Error setting up scan for {chat_id} - Bad Request error. Abandoning, and deleting from DB.")
-                del_chats_from_db([chat_id])
+                admins = chat_admins_cache.get(active_id)
+                titles = get_chat_ids_and_names()
+                chat_title = titles.get(active_id)
+                last_admin_update = lookup_last_admin_update(active_id)
+                if (not last_admin_update) or (last_admin_update and (datetime.now(timezone.utc) - last_admin_update > timedelta(minutes=60))):
+                    outdated_admin_lookups.append(active_id)
+                if not admins:
+                    await authorize_chat_and_update_cache(active_id, chat_title)
+                if await is_user_admin(kickbot.id, active_id):
+                    i_am_admin.append(active_id)        
+                    logging.info(f"Bot is not an admin in {chat_title}. Skipping scan.")
+            except Exception as e:
+                logging.error(f"Error setting up scan for {chat_title} – {e}. Abandoning scan for this chat.")
                 continue
-            except Exception:
-                logging.error(f"Error setting up scan for {chat_id} - Either not a member or couldn't retrieve admin list. Abandoning chat.")
-                continue
+
+        for lookup in outdated_admin_lookups:
+            await update_chat_admins_cache(lookup)
 
         if len(i_am_admin) > 0:
             # Create a list of tasks
             results_list = []
             tasks = [process_chat_member_updates(chat_id, update, context) for chat_id in i_am_admin]
 
-            # Execute tasks concurrently using asyncio.gather()
+            # Execute group chat processing concurrently using asyncio.gather()
             results_list = await asyncio.gather(*tasks, return_exceptions=True)
-            shin_ids = set(keyword_search_from_db('shinanygans'))
             
-
             # Process obligation kicks in batch
             if results_list:
                 for results in results_list:
@@ -976,54 +769,22 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
                     if 'chat_id' not in results or 'joined_user_ids' not in results:
                         continue
                     try:
-                        results_chat_id = results.get('chat_id')
-                        results_joined_user_ids = results.get('joined_user_ids')
-                        results_chat = await kickbot.get_chat(results_chat_id)  
-                        results_chat_type = results_chat.type
-                        admins = lookup_admin_ids(results_chat_id)
-                        last_scan = lookup_last_scan(results_chat_id)
-                        chat_name_dict = get_chat_ids_and_names()
-                        suspend_obligation_kicks = (not last_scan) or (last_scan and (datetime.utcnow().replace(tzinfo=utc_timezone) - last_scan) > timedelta(minutes=10))
-                        obligation_chat_id = lookup_obligation_chat(results_chat_id)
-                        whitelist_data = get_whitelist(chat_id)
-
-                        # Convert user_data and admin_ids into sets for faster lookups
-                        whitelist_set = {entry[0] for entry in whitelist_data}
-                        if obligation_chat_id and not suspend_obligation_kicks:
-                            for joined_user_id in results_joined_user_ids:
-                                try:
-                                    if joined_user_id not in AUTHORIZED_ADMINS and joined_user_id not in admins and joined_user_id not in whitelist_set and joined_user_id not in shin_ids:
-                                        lookup = lookup_active_group_member(joined_user_id, obligation_chat_id)
-                                        logging.warning(f"SCAN: Joining user {joined_user_id} {'DOES' if len(lookup)>0 else 'DOES NOT'} appear in our internal DB for obligation chat {obligation_chat_id}")
-                                        if len(lookup)==0:
-                                            # If user not found locally in obligation chat, verify with a get_chat_member lookup before kicking
-                                            joined_chat_obligation_member = await kickbot.get_chat_member(obligation_chat_id, joined_user_id)
-                                            joined_user_member_dict = {}
-                                            if joined_chat_obligation_member.status not in ["administrator", "creator", "member"]:
-                                                joined_user_member_dict = lookup_group_member(joined_user_id)
-                                                joined_user_member_dict = joined_user_member_dict[0] if len(joined_user_member_dict)>0 else None
-                                                joined_user_name = (f"{joined_user_member_dict.get('user_name') if joined_user_member_dict else ''}")
-
-                                                logging.warning(f"SCAN: {results_chat_id} OBLIGATION KICK: {joined_user_name} ({joined_user_id} - @{joined_user_member_dict.get('username') }) kicked from {chat_name_dict.get('results_chat_id')} for not belonging to {chat_name_dict.get(obligation_chat_id)}.")
-
-                                                joined_user_telethon = await telethon.get_entity(joined_user_id)
-                                                await obligation_kick(joined_user_id, results_chat_id, results_chat_type, joined_user_name, chat_name_dict.get(obligation_chat_id))
-                                                update_or_insert_chat_member(joined_user_telethon, results_chat_id, "last_kicked", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
-                                except Exception as e:
-                                    logging.warning(f"SCAN: Exception raised with joined user id {joined_user_id} - {e} while evaluating obligation kicks. Moving on to next joined user in list.")
-                                    continue
-                    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
-                        logging.warning(f"SCAN: While evaluating obligation kicks, bad request or no permissions error with chat.")
-                        if chat_id:
-                            del_chats_from_db([chat_id])
-                            logging.warning(f"SCAN: Bad request or no permissions error with {chat_id}. Probably nuked. Removing from authorized chats.")
-                        continue
+                        await process_scanner_obligation_kicks(results)
                     except Exception as e:
                         logging.warning(f"SCAN: Exception raised with {chat_id} - {e}. Moving on to next chat in list.")
                         continue
+                    results_chat_id = results.get('chat_id')
                     insert_last_scan(results_chat_id)
+
+            # Update the left_groups table with those users who have recently left a chat
             update_left_groups()
-            let_leave_without_banning.clear()
+
+        # Clear the lat_leave_without_banning list, in case any old values have not been properly erased
+        # This list is expected to be empty because values should be cleared in real time as the user exits the group
+        let_leave_without_banning.clear()
+
+        # Clear the scanning_underway list, as the scanning is now complete for all chats
+        # This list is expected to be empty by this point because individual chats are removed from it after processing
         scanning_underway.clear()
         logging.warning("SCAN: Update completed.")
         return
@@ -1034,6 +795,391 @@ async def update_chat_members(update: Update=None, context: CallbackContext=None
         logging.error(f"Error in the update_chat_members() function: {e}")
         scanning_underway.clear()
         return
+
+
+async def process_chat_member_updates(chat_id, update: Update=None, context: CallbackContext=None):  
+    start_time = time.time()  # Start timer at the very beginning of the function
+    try:
+        await check_telethon_connection()
+        global scanning_underway
+        global kick_started
+        scanning_underway.append(chat_id)
+        try:
+            chat = await kickbot.get_chat(chat_id)
+        except Exception as e:
+            logging.error(f"Error in process_chat_member_updates() - {e}")
+            return {}
+
+        admin_ids = chat_admins_cache.get(chat_id, set())
+        shin_ids = set(keyword_search_from_db('shinanygans'))
+        whitelist_data = get_whitelist(chat_id)
+
+        # Convert user_data and admin_ids into sets for faster lookups
+        whitelist_set = {entry[0] for entry in whitelist_data}
+
+        # Step 1: Fetch the list of user_ids from the chat_member table for the given chat_id
+        member_ids_in_db = set(list_member_ids_in_db(chat_id)) # Users who are currently 'Member' or 'Admin' of 'Creator' status
+        unknown_status_in_db = set(list_unkonwn_status_in_db(chat_id))
+        banned_ids_in_db = set(list_banned_users_in_db(chat_id)) # Users who are currently 'Banned' status
+        is_supergroup = True if chat.type == ChatType.SUPERGROUP or chat.type == ChatType.CHANNEL else False
+
+
+        # Step 2: Iterate through the participants returned by iter_participants, and update a list of db insertion parameters
+        logging.warning(f"Cataloging members of {chat_id}")
+
+
+        if is_supergroup:
+            participants, banned_users = await asyncio.gather(
+                iterate_chat_participants(chat_id),
+                iterate_banned_chat_participants(chat_id)
+            )
+            if participants is None or banned_users is None:
+                error_message = "banned user scan" if banned_users is None else "room scan"
+                logging.warning(f"{error_message} of {chat_id} returned a severe exception. Abandoning scan.")
+                return {}
+            batch_insert_parameters, participant_user_ids = participants
+            banned_user_ids = banned_users
+        else:
+            results = await iterate_chat_participants(chat_id)
+            if results is None:
+                logging.warning(f"Room scan of {chat_id} returned a severe exception. Abandoning scan.")
+                return {}
+            batch_insert_parameters, participant_user_ids = results
+
+
+        # Mark end of iter_participants section and log duration if TIMER_CHAT
+        end_iter_time = time.time()
+            
+        batch_insert_or_update_chat_member(batch_insert_parameters)
+
+
+        # Step 3: Identify users that have left or joined, or who were previously banned
+        user_ids_not_in_iter_participants = member_ids_in_db.union(unknown_status_in_db) - participant_user_ids # Members, Admins or 'Not Available's in DB minus current chat occupants = Left since last scan 
+        
+        left_user_ids = await verify_user_left_chat(user_ids_not_in_iter_participants, chat_id)
+
+        joined_user_ids = participant_user_ids - member_ids_in_db.union(unknown_status_in_db) # Current chat occupants minus Members/Admins/Not Available in DB = Net new + rejoins and unbanned
+        unbanned_user_ids = joined_user_ids.intersection(banned_ids_in_db) # Currently banned in the DB but rejoined the group
+        user_ids_to_ban = left_user_ids - admin_ids - let_leave_without_banning - shin_ids - whitelist_set
+        results = {'chat_id': chat_id, 'joined_user_ids': joined_user_ids}
+    
+
+        # Step 4: Batch update the database for users that have left 
+        batch_update_joined(joined_user_ids, chat_id)
+        batch_update_left(left_user_ids, chat_id)
+        # remove_unbanned_user_from_blacklist(unbanned_user_ids, chat_id)
+
+
+        # Mark end of database update section and log duration if TIMER_CHAT
+        end_db_update_time = time.time()
+            
+
+        # Step 5: If ban_leavers_mode is on, ban anyone with a status of "left"
+        ban_leavers_mode = get_ban_leavers_status(chat_id)
+        if ban_leavers_mode[0]==1:
+            last_scan = lookup_last_scan(chat_id)
+            suspend_banning = (not last_scan) or (last_scan and (datetime.now(timezone.utc) - last_scan) > timedelta(minutes=10))
+            
+            if len(user_ids_to_ban) > 0:
+                if not suspend_banning:
+                    logging.warning(f"BAN-LEAVERS MODE ON FOR {chat_id} - THE FOLLOWING {len(user_ids_to_ban)} USERS WILL BE BANNED:")
+                    logging.warning(user_ids_to_ban)
+                    await uniban_from_list(user_ids_to_ban, reason = f'SCAN - LEFT {chat.title} WHILE NO-LEAVERS MODE ON')
+                else:
+                    logging.warning(f"BAN-LEAVERS MODE ON FOR {chat_id} - NO SCAN IN LAST 10 MINUTES - BANNING SUSPENDED.")
+
+
+            for joined_user_id in joined_user_ids:
+                if (joined_user_id, chat_id) in let_leave_without_banning:
+                    let_leave_without_banning.discard((joined_user_id, chat_id))
+
+        # Mark end of ban leavers section and log duration if TIMER_CHAT
+        end_ban_leavers_time = time.time()
+            
+
+        # Step 6: Get total list of banned users, including any that were just banned by activating banned_leavers mode.
+        if is_supergroup:           
+
+            # Remove the users already banned in the database, so as to only update those who were not banned before the scan.
+            update_ban_status = banned_user_ids - banned_ids_in_db
+
+            # Set status, last_banned, and times_banned fields for those just banned
+            batch_update_banned(update_ban_status, chat_id)
+
+            # Arrive at a list of manually-unbanned users by subtracting currently banned users from those marked as banned in the DB.
+            manually_unbanned =  banned_ids_in_db - banned_user_ids
+            # remove_unbanned_user_from_blacklist(manually_unbanned, chat_id)
+            batch_update_left(manually_unbanned, chat_id)
+
+        else:
+            if ban_leavers_mode[0]==1 and context and len(left_user_ids) > 0:
+                # Set status, last_banned, and times_banned fields for those just banned
+                batch_update_banned(user_ids_to_ban, chat_id)   
+
+
+        # Mark end of get banned list section and log duration if TIMER_CHAT
+        end_get_banned_list_time = time.time()
+            
+
+        scanning_underway.remove(chat_id)
+
+        # If no one has been kicked from this chat in the last 10 minutes, make sure the kick_started boolean is false
+        # This variable is expected to be set back to false when a kick ends, but the following block will periodically make sure it is reset
+        most_recent_kick = lookup_most_recent_kick_timestamp(chat_id)
+        no_kick_in_last_ten = (not most_recent_kick ) or (most_recent_kick  and (datetime.now(timezone.utc) - most_recent_kick ) > timedelta(minutes=10))
+        if no_kick_in_last_ten:
+            kick_started == False
+
+        # Final logging for the last part of the function if TIMER_CHAT
+        end_time = time.time()
+            
+
+        print(f"SCAN: Update of {chat_id} ({chat.title}) completed. Scan found {len(joined_user_ids)} new users and {len(left_user_ids)} users who left. Scan time: {end_time - start_time:.2f} sec.")
+    
+    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError, NetworkError, RetryAfter, TimedOutError) as e:
+        logging.warning(f"Bot does not seem to have Admin rights in {chat.title} Chat processessing not completed.\n")
+        scanning_underway.remove(chat_id)
+        return {}
+    
+    except (ConnectionRefusedError, ConnectionError) as e:
+        logging.error(f"Connection to Telethon Bot interrupted. Chat processessing not completed.\n")
+        scanning_underway.remove(chat_id)
+        return {}
+    
+    except Exception as e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
+        logging.error(f"Error in the process_chat_member_updates() function: {e}")
+        scanning_underway.remove(chat_id)
+        return {}
+    return results
+
+
+async def iterate_chat_participants(chat_id):
+    try:
+        participant_user_ids = set()
+        batch_insert_parameters = []
+
+        async for participant in telethon.iter_participants(chat_id):
+            user_id = participant.id
+            member_record_dict = lookup_group_member(user_id, chat_id)
+            member_record_dict = member_record_dict[0] if len(member_record_dict) > 0 else None
+            if not hasattr(participant, 'participant'):
+                user_status = 'Not Available'
+            elif isinstance(participant.participant, ChannelParticipantAdmin):
+                user_status = 'Admin'
+            elif isinstance(participant.participant, ChannelParticipantCreator):
+                user_status = 'Creator'
+            elif isinstance(participant.participant, ChannelParticipant):
+                user_status = 'Member'
+            elif isinstance(participant.participant, ChatParticipantAdmin):
+                user_status = 'Admin'
+            elif isinstance(participant.participant, ChatParticipantCreator):
+                user_status = 'Creator'
+            elif isinstance(participant.participant, ChatParticipant):
+                user_status = 'Member'
+            elif isinstance(participant.participant, ChannelParticipantBanned):
+                user_status = 'Banned'      
+            else:
+                user_status = 'Not Available'
+
+            batch_insert_parameters.append((
+                user_id,
+                chat_id,
+                " ".join(filter(None, [participant.first_name, participant.last_name])),
+                participant.username,
+                participant.premium,
+                participant.verified,
+                participant.bot,
+                participant.fake,
+                participant.scam,
+                participant.restricted,
+                participant.restriction_reason if participant.restriction_reason else None,
+                user_status,
+                user_id,
+                chat_id,
+                participant.participant.date.strftime("%Y-%m-%d %H:%M:%S.%f") if hasattr(participant.participant, 'date') else None,
+                participant.participant.date.strftime("%Y-%m-%d %H:%M:%S.%f") if hasattr(participant.participant, 'date') else None,
+                #last_left
+                user_id,
+                chat_id,
+                #last_kicked
+                user_id,
+                chat_id,
+                #last_posted
+                user_id,
+                chat_id,
+                #last_banned
+                user_id,
+                chat_id,
+                #times_joined
+                user_id,
+                chat_id,
+                #times_posted
+                user_id,
+                chat_id, 
+                #times_left
+                user_id,
+                chat_id, 
+                #times_kicked
+                user_id,
+                chat_id,
+                #times_banned
+                user_id,
+                chat_id
+            ))
+            if user_status != 'Banned':
+                participant_user_ids.add(user_id)
+        return batch_insert_parameters, participant_user_ids
+    except Exception as e:
+        logging.error(f" Error getting participant information during lookup: {e}")
+        return None
+
+
+async def iterate_banned_chat_participants(chat_id):
+    banned_user_ids = set()
+    if chat_id == -1002100074918:
+        pass
+    try:
+        async for participant in telethon.iter_participants(chat_id, filter = ChannelParticipantsKicked):     
+            participant_id = getattr(participant, 'id', None)
+            if participant_id and isinstance(participant_id, int):
+                banned_user_ids.add(participant_id)
+    except (AttributeError, ValueError) as e:
+        logging.error(f"Error getting banned participant information during lookup: {e}")
+        # Capture the exception and the traceback
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        # Format the traceback as a string
+        traceback_details = traceback.format_exception(exc_type, exc_value, exc_traceback)
+        # Log the detailed traceback
+        print("Error occurred:\n" + "".join(traceback_details))
+        return set()
+    except Exception as e:
+        logging.error(f"Severe error getting banned participant information during lookup: {e}")
+        return None
+
+    return banned_user_ids
+
+
+async def verify_user_left_chat(user_list, chat_id):
+    # Under the right conditions, users who leave the chat may be subject to ban.
+    # If the user is not found by telethon's iter_participants(), this function will veryify they have a chat status if 'left'
+    left_user_ids = set()
+    for user_id_to_be_verified in user_list:
+        try:
+            result = None
+            result_user_id = None
+            result = await kickbot.get_chat_member(chat_id, user_id_to_be_verified)
+            result_user_id = result.user.id
+        except Exception as e:
+            logging.warning(f"SCAN: Error verifying {user_id_to_be_verified} left {chat_id} - {e}")
+            batch_update_left([user_id_to_be_verified], chat_id)# UPDATE IN DB DIRECTLY WITHOUT FLAGGING AS A LEFT USER FOR BANNING PURPOSES
+        if not result:
+            continue # If the user is not found in the chat, it is unclear what is wrong but they shouldn't be banned
+        if result.status in ["member", "administrator", "creator"]:
+            pass
+        elif result.status == 'left': # In this condition, the user has left the chat and is rightly subject to ban
+            left_user_ids.add(result_user_id)
+        elif result.status == 'kicked': # In telethon vocabulary, 'kicked' means banned (i.e. on the 'removed' list).
+            batch_update_banned([result_user_id], chat_id)
+        else:
+            pass
+
+    return left_user_ids
+
+
+async def process_scanner_obligation_kicks(results):
+    # "results" is a dict with a chat_id int and a joined_user_ids list of ints
+    try:
+        results_chat_id = results.get('chat_id')
+        if not results_chat_id:
+            return
+        # This shouldn't happen, but if for any reason there are no admins in the cache, abandon further processing
+        admins = chat_admins_cache.get(results_chat_id)
+        if not admins:
+            return
+
+        obligation_chat_id = lookup_obligation_chat(results_chat_id)
+        last_scan = lookup_last_scan(results_chat_id)
+
+        # If this is the first scan, or it's been over an hour since the last scan, we will not run obligation kicks
+        # Most likely the bot was just switched on after being off, and we will avoid kicking the backlogged users
+        suspend_obligation_kicks = (not last_scan) or (last_scan and (datetime.now(timezone.utc)) - last_scan) > timedelta(minutes=10)
+
+        # If no obligation chat is assigned, or if obligation kicks are suspended, abandon further processing
+        if not obligation_chat_id or suspend_obligation_kicks:
+            return
+
+        results_joined_user_ids = results.get('joined_user_ids')
+        results_chat = await kickbot.get_chat(results_chat_id)  
+        results_chat_type = results_chat.type
+        chat_name_dict = get_chat_ids_and_names()
+        whitelist_data = get_whitelist(results_chat_id)
+        whitelist_set = {entry[0] for entry in whitelist_data}
+        shin_ids = set(keyword_search_from_db('shinanygans'))
+
+        #For every new user who just joined the chat...
+        
+        for joined_user_id in results_joined_user_ids:
+            try:
+                # If the newly joined user meets one of the following immunity conditions, move on to the next user
+                if joined_user_id in AUTHORIZED_ADMINS:
+                    continue
+                elif joined_user_id in admins:
+                    continue
+                elif joined_user_id in whitelist_set:
+                    continue
+                elif joined_user_id in shin_ids:
+                    continue
+
+                # Look in our internal group_member database table to see if the newly joined user is a member of the proper obligation chat
+                lookup = lookup_active_group_member(joined_user_id, obligation_chat_id)
+                logging.warning(f"SCAN: Joining user {joined_user_id} {'DOES' if len(lookup)>0 else 'DOES NOT'} appear in our internal DB for obligation chat {obligation_chat_id}")
+
+                # If user not found locally in obligation chat, verify with a get_chat_member lookup before kicking
+                if len(lookup)==0:
+                    joined_chat_obligation_member = await kickbot.get_chat_member(obligation_chat_id, joined_user_id)
+                    joined_user_member_dict = {}
+
+                    # If the newly joined member is veified to NOT be an active member of the obligation chat, get the required user_name and entity object and process the kick.
+                    if joined_chat_obligation_member.status not in ["administrator", "creator", "member"]:
+                        joined_user_member_dict = lookup_group_member(joined_user_id)
+
+                        # Adjust joined_user_member_dict to be the first record returned by lookup_group_member(), or None
+                        joined_user_member_dict = joined_user_member_dict[0] if len(joined_user_member_dict)>0 else None
+                        joined_user_name = (f"{joined_user_member_dict.get('user_name') if joined_user_member_dict else ''}")
+
+                        logging.warning(f"SCAN: {results_chat_id} OBLIGATION KICK: {joined_user_name} ({joined_user_id} - @{joined_user_member_dict.get('username') }) kicked from {chat_name_dict.get('results_chat_id')} for not belonging to {chat_name_dict.get(obligation_chat_id)}.")
+
+                        joined_user_telethon = await telethon.get_entity(joined_user_id)
+                        await obligation_kick(joined_user_id, results_chat_id, results_chat_type, joined_user_name, chat_name_dict.get(obligation_chat_id))
+
+                        #Insert or update this group member in the satabase, with a status of "kicked"
+                        update_or_insert_group_member(results_chat_id, joined_user_telethon, EventType.KICKED)
+            except Exception as e:
+                logging.warning(f"SCAN: Exception raised with joined user id {joined_user_id} - {e} while evaluating obligation kicks. Moving on to next joined user in list.")
+                continue
+    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
+        logging.warning(f"SCAN: While evaluating obligation kicks, bad request or no permissions error with chat.")
+
+    except Exception as e:
+        logging.warning(f"SCAN: Exception raised with {results_chat_id} - {e}.")
+    return
+
+
+async def suspend_scanning():
+    if not tracking_chat_members:
+        return
+    global scanning_underway
+    logging.warning("Suspending timed chat tracking.")
+    schedule.clear()
+    while kick_started:
+        await asyncio.sleep(1)
+    schedule.every(3).minutes.do(update_chat_members)
+
+    logging.warning("Timed chat tracking re-started.")
+
+    return
 
 
 # Function to run the scheduled tasks
@@ -1203,14 +1349,7 @@ async def chat_status(update: Update, context: CallbackContext):
         update.message.reply_text("No arguments provided.")
         return
 
-    try:
-        admins = await update.effective_chat.get_administrators()
-        admin_ids = [admin.user.id for admin in admins]
-    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
-        logging.warning(f"Bad Request/Forbidden in chat_status() - Bot no longer in group.")
-        return
-        
-    if context.bot.id not in admin_ids:
+    if not is_user_admin(context.bot.id, chat_id):
         return
     
     if chat_type == ChatType.PRIVATE:
@@ -1286,7 +1425,7 @@ async def chat_status(update: Update, context: CallbackContext):
         logging.error(f"Error assembling chat stats: {e}")
     return
 
-
+'''
 async def ban_from_blacklist(update: Update, context: CallbackContext):
     chat_id = update.message.chat_id
     chat_name = update.effective_chat.title
@@ -1342,7 +1481,7 @@ async def ban_from_blacklist(update: Update, context: CallbackContext):
             logging.error(f"Error assembling chat stats: {e}")
     return
 
-
+'''
 async def lookup(update: Update, context: CallbackContext):
     chat_id = update.message.chat_id
     issuer_user_id = update.effective_user.id
@@ -1350,6 +1489,12 @@ async def lookup(update: Update, context: CallbackContext):
 
     id_or_username = context.args[0]
     try:
+        if chat_type != ChatType.PRIVATE:
+            message = await context.bot.send_message(
+                chat_id=chat_id,
+                text="<i style='color:#808080;'> Response will be sent privately.</i>",
+                parse_mode=ParseMode.HTML
+            )
         id_or_username = int(id_or_username)
     except:
         pass   
@@ -1360,43 +1505,29 @@ async def lookup(update: Update, context: CallbackContext):
         
     except Exception as e:
         logging.error(f" Error getting entity and chat member information during lookup: {e}")
-        chat_member = None
+        await context.bot.send_message(chat_id=issuer_user_id, text=f"Error looking up user {id_or_username} in Telegram.")
+        return
     try:
         if chat_type != ChatType.PRIVATE:
-            message = await context.bot.send_message(
-                chat_id=chat_id,
-                text="<i style='color:#808080;'> Response will be sent privately.</i>",
-                parse_mode=ParseMode.HTML
-            )
-            asyncio.create_task(delete_message_after_delay(context, message))
             group_member_dict = lookup_group_member(kicked_user_id, chat_id)
         else:
             group_member_dict = lookup_group_member(kicked_user_id)
 
         kicked_user_data = lookup_user_in_kick_db(kicked_user_id)
-        blacklist_data = lookup_user_in_blacklist(kicked_user_id)
+        # blacklist_data = lookup_user_in_blacklist(kicked_user_id)
 
         if not group_member_dict or len(group_member_dict)==0:
             kicked_user_message = "User not found in kickbot database."
         else:
             group_member_first = group_member_dict[0]
-            # kicked_user_name = f"{kicked_user.first_name}{' ' + kicked_user.last_name if kicked_user.last_name else ''}"
             kicked_user_name = group_member_first['user_name']
-            # kicked_user_username = kicked_user.username
             kicked_user_username = group_member_first['user_username']
-            # kicked_user_is_bot = kicked_user.bot
             kicked_user_is_bot = 'True' if group_member_first['is_bot'] else 'False'
-            #kicked_user_is_premium = kicked_user.premium
             kicked_user_is_premium = 'True' if group_member_first['is_premium'] else 'False'
-            #kicked_user_is_fake = kicked_user.fake
             kicked_user_is_fake = 'True' if group_member_first['is_fake'] else 'False'
-            #kicked_user_is_restricted = kicked_user.restricted
             kicked_user_is_restricted = 'True' if group_member_first['is_restricted'] else 'False'
-            #kicked_user_restriction_reason = kicked_user.restriction_reason if kicked_user.restriction_reason else ""
             kicked_user_restriction_reason = group_member_first['restricted_reason']  if group_member_first['restricted_reason'] else ''
-            #kicked_user_is_scam = kicked_user.scam
             kicked_user_is_scam = 'True' if group_member_first['is_scam'] else 'False'
-            #kicked_user_is_verified = kicked_user.verified
             kicked_user_is_verified = 'True' if group_member_first['is_verified'] else 'False'
             
             kicked_user_message="KICKBOT USER RECORD\n"
@@ -1406,8 +1537,6 @@ async def lookup(update: Update, context: CallbackContext):
             kicked_user_message+=f"PREMIUM: {kicked_user_is_premium}\n"
             kicked_user_message+=f"VERIFIED: {kicked_user_is_verified}\n"
             kicked_user_message+=f"IS BOT: {kicked_user_is_bot}\n"
-            kicked_user_message+=f"IS FAKE: {kicked_user_is_fake}\n"
-            kicked_user_message+=f"IS SCAM: {kicked_user_is_scam}\n"
             kicked_user_message+=f"RESTRICTED: {kicked_user_is_restricted}\n"
             kicked_user_message+=f"{'RESTR REASON: ' if group_member_first['is_restricted'] else ''}{kicked_user_restriction_reason}\n\n"
         await context.bot.send_message(chat_id=issuer_user_id, text=kicked_user_message)
@@ -1415,21 +1544,25 @@ async def lookup(update: Update, context: CallbackContext):
         i_am_admin = []
         for group_member_row in group_member_dict:
             group_member_chat_id = group_member_row['chat_id']
-            admins = await context.bot.get_chat_administrators(group_member_chat_id)
-            admin_ids = [admin.user.id for admin in admins]
-            if kickbot.id in admin_ids:
-                i_am_admin.append(group_member_row)
+            admins = chat_admins_cache.get(group_member_chat_id)
+            titles = get_chat_ids_and_names()
+            group_member_chat_title = titles.get(group_member_chat_id)
+            if not admins:
+                await authorize_chat_and_update_cache(group_member_chat_id, group_member_chat_title)
+            if await is_user_admin(kickbot.id, group_member_chat_id):
+                i_am_admin.append(group_member_row)   
+    
 
-        for group_member_row in i_am_admin:
-            kicked_user_chat_id = group_member_row['chat_id']
+        for i_am_admin_row in i_am_admin:
+            kicked_user_chat_id = i_am_admin_row['chat_id']
             chat = await telethon.get_entity(kicked_user_chat_id)       
             chat_name = chat.title
             kicked_user_row = next((row for row in kicked_user_data if row[1] == chat_id), None)
-            blacklist_row = next((row for row in blacklist_data if row[1] == chat_id), None)
+            # blacklist_row = next((row for row in blacklist_data if row[1] == chat_id), None)
 
             kicked_user_number_kicks = kicked_user_row[2] if kicked_user_row else None
-            if group_member_row['last_posted']:
-                kicked_user_last_posted = datetime.strptime(group_member_row['last_posted'], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S')
+            if i_am_admin_row['last_posted']:
+                kicked_user_last_posted = datetime.strptime(i_am_admin_row['last_posted'], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S')
             else:
                 kicked_user_last_posted = "Never"
             kicked_user_last_kicked = datetime.strptime(kicked_user_row[4], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if kicked_user_row else None
@@ -1447,7 +1580,7 @@ async def lookup(update: Update, context: CallbackContext):
                 elif chat_member.status == ChatMember.BANNED:
                     kicked_user_status = "Banned"
                 elif chat_member.status == ChatMember.LEFT:
-                    kicked_user_status = group_member_row['status'] if group_member_row['status'] else "Left"
+                    kicked_user_status = 'Kicked' if i_am_admin_row['status']=='Kicked' else "Left" #Kicked if in DB as Kicked, else Left
                 elif chat_member.status == ChatMember.MEMBER:
                     kicked_user_status = "Member"
                 elif chat_member.status == ChatMember.OWNER:
@@ -1461,13 +1594,9 @@ async def lookup(update: Update, context: CallbackContext):
 
             # Search for the user in the list of participants
             kicked_user_last_joined = datetime.strptime(group_member_row['last_joined'], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if group_member_row['last_joined'] else 'N/A'
-            #kicked_user_last_joined = None
-            #async for participant in telethon.iter_participants(kicked_user_chat_id, search=kicked_user.first_name):
-            #    if participant.id == kicked_user_id:
-            #        kicked_user_last_joined = participant.participant.date.strftime('%d %B, %Y - %H:%M:%S') if chat_member.status == ChatMember.MEMBER else None
-            #        break
             kicked_chat_message=""
-            kicked_chat_message+=f"{kicked_user_name} - {chat_name}{' - BLACKLISTED' if blacklist_row else ''}\n"
+            kicked_chat_message+=f"{kicked_user_name} - {chat_name}"
+            # kicked_chat_message+=' - BLACKLISTED\n' if blacklist_row else '\n'
             kicked_chat_message+=f"KICKS from {chat_name}: {kicked_user_number_kicks}\n"
             kicked_chat_message+=f"BANS from {chat_name}: {group_member_row['times_banned'] if group_member_row['times_banned'] else 'N/A'}\n"
             kicked_chat_message+=f"MOST RECENTLY JOINED: {kicked_user_last_joined if kicked_user_last_joined else 'N/A'}\n"
@@ -1531,8 +1660,6 @@ async def find_inactive_chats():
             while rt < max_retries:
                 try:
                     chat = await kickbot.get_chat(chat_id)
-                    #Use the authorization check as a way to update the chat name in the database
-                    #is_chat_authorized(chat_id, chat.title)  
                     if chat.type == ChatType.PRIVATE:
                         # if not a private bot chat:
                         inactive_chats.append(chat_id)
@@ -1588,9 +1715,6 @@ async def show_wholeft(update: Update, context: CallbackContext):
         else:
             wholeft_data = get_wholeft_from_private()
 
-        # wholeft_message = "USERS WHO LEFT\n"
-        # wholeft_message += "Users leaving in -10min listed individually\n\n"
-
         # Group users by channel_id
         users_by_channel = {}
         for user_id, channel_id, _, _, time_in_group_str, user_name in wholeft_data:
@@ -1640,8 +1764,6 @@ async def show_wholeft(update: Update, context: CallbackContext):
 
                 
                 if user_id not in users_to_report:
-                    # if avg_time_in_group < timedelta(minutes=10):
-                    #    wholeft_message += f"{user_name} ({user_id}) - Times Left: {num_times_left}, Avg Time in Group: {avg_time_str}\n"
                     users_to_report.append(user_id)
 
                     # Write data to CSV file
@@ -1651,13 +1773,6 @@ async def show_wholeft(update: Update, context: CallbackContext):
                         # Write data for the current user
                         csv_writer.writerow([channel_id, title, user_id, user_name, num_times_left, avg_time_str])
 
-
-            # wholeft_message += "\n"
-
-        # if chat_id in DEBUG_CHATS:
-           # await context.bot.send_message(chat_id=chat_id, text=f"DEBUG: {wholeft_message}")
-
-        # await context.bot.send_message(chat_id=issuer_user_id, text=wholeft_message)
         # Upload the CSV file
         with open(csv_filename, 'rb') as csv_file:
             await context.bot.send_document(chat_id=issuer_user_id, document=csv_file, filename="leavers.csv")
@@ -1679,7 +1794,7 @@ async def show_wholeft(update: Update, context: CallbackContext):
 
     return
 
-
+'''
 async def get_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     chat_id = update.effective_chat.id
@@ -1735,7 +1850,7 @@ async def get_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
         logging.error(f"Error in the blacklist printing process: {e}")
     return
-
+'''
 
 async def set_backup(update, context):
     user_id = update.effective_user.id
@@ -1764,9 +1879,12 @@ async def set_backup(update, context):
         i_am_admin = []
         active_ids = list_chats_in_db()
         for active_id in active_ids:
-            admins = await kickbot.get_chat_administrators(active_id)
-            admin_ids = [admin.user.id for admin in admins]
-            if kickbot.id in admin_ids:
+            admins = chat_admins_cache.get(active_id)
+            titles = get_chat_ids_and_names()
+            chat_title = titles.get(active_id)
+            if not admins:
+                await authorize_chat_and_update_cache(active_id, chat_title)
+            if await is_user_admin(kickbot.id, active_id):
                 i_am_admin.append(active_id)
 
 
@@ -1847,8 +1965,6 @@ async def button_click(update, context):
             # Perform the operation to set the obligation_chat to None
             delete_obligation_chat(issuer_chat_id)
             message_text = f"Obligation group set to <strong>None</strong> for <strong>{issuer_chat_title}</strong>."
-
-
         else:
             try:
                 choice_int = int(choice)
@@ -1900,7 +2016,7 @@ async def obligation_kick(user_id, chat_id, chat_type, user_name, obligation_cha
                 await kickbot.unban_chat_member(chat_id, user_id)
             else:
                 await kickbot.ban_chat_member(chat_id, user_id)
-                insert_kicked_user_in_blacklist(user_id, chat_id)      
+                # insert_kicked_user_in_blacklist(user_id, chat_id)      
             #logging.warning(let_leave_without_banning)
             break
 
@@ -1933,120 +2049,168 @@ async def obligation_kick(user_id, chat_id, chat_type, user_name, obligation_cha
 
 
 
-# ********* CHAT EVENT HANDLING *********
+# ********* REALTIME CHAT EVENT HANDLING *********
+
+async def process_realtime_obligation_kick(context, chat_id, user_id, user_name, username, chat_name_dict):
+    obligation_chat_id = lookup_obligation_chat(chat_id)
+    if not obligation_chat_id:
+        return
+    chat_name = chat_name_dict.get(chat_id) 
+    obligation_chat_name = chat_name_dict.get(obligation_chat_id) if obligation_chat_id else ''
+    try:
+        # Is user a member of the required obligation chat?
+        obligation_member = await context.bot.get_chat_member(obligation_chat_id, user_id)
+        if obligation_member.status not in ["member", "administrator", "creator"]:
+            await obligation_kick(user_id, chat_id, user_name, obligation_chat_name)
+            update_or_insert_group_member(chat_id, user_id, EventType.KICKED)
+            logging.warning(f"REALTIME: Obligation kick for {user_name} ({user_id}, @{username}) from {chat_name} for not being in {obligation_chat_name}.")
+    except Exception as e:
+        logging.error(f"Error checking obligation chat membership for {user_id}: {e}")
+    return
 
 
-# Add a user_id to the database whenever the bot sees them enter a chat.
+async def process_realtime_ban_leavers(new_chat_member, new_status, chat_id, user_id, user_name, username, chat_name_dict):
+    # This function executes if ban_leavers_mode is on, and will ban anyone with a status of "left"
+    global let_leave_without_banning
+    try:   
+        excused = any([user_id == user and chat_id == chat for user, chat in let_leave_without_banning])
+        chat_name = chat_name_dict.get(chat_id) 
+        member = lookup_group_member(user_id, chat_id)
+        status = member[0]['status'] if member else None # Current database status of leaver
+        logging.warning(f"REALTIME: {chat_id} -- {user_name} (@{username}, {user_id}) leaving {chat_name}. Chat status is: {new_status}. "
+            f"Ban Leavers mode is {'ON' if ban_leavers_mode[0]==1 else 'OFF'}. "
+            f"Obligation kick hallpass list: {let_leave_without_banning}"
+        )
+        # If user has been kicked due to an obligation kick, excuse then from being banned
+        if not excused:
+            left_user_ids = [user_id]
+            if status == "Kicked":
+                logging.warning(f"REALTIME: BAN-LEAVERS MODE ON FOR {chat_id}, BUT {user_name} ALREADY KICKED. DOING NOTHING.")
+            else:
+                logging.warning(f"REALTIME: BAN-LEAVERS MODE ON FOR {chat_id} - UNI-BANNING {user_name}")
+                await uniban_from_list(left_user_ids, reason = f'REALTIME - LEFT {chat_name} WHILE NO-LEAVERS MODE ON')
+            update_or_insert_group_member(chat_id, new_chat_member, EventType.BANNED)
+
+        # If the user is on the excused list, log that they were kicked because of an obligation chat.
+        else:
+            logging.warning(f"REALTIME: {user_name} KICKED FROM {chat_name} FOR NOT BELONGING TO OBLIGATION CHAT.")       
+    except Exception as e:
+        logging.error(f"Error checking obligation chat membership for {user_id}: {e}")
+    let_leave_without_banning.discard((user_id, chat_id))
+    return
+
+
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ Thank you to python-telegram-bot example chatmemberbot.py for the model of this function
         https://github.com/python-telegram-bot/python-telegram-bot/blob/master/examples/chatmemberbot.py
     """
-    global let_leave_without_banning
-    await check_telethon_connection()
-   
-    chat_id = update.effective_chat.id
-    chat_name = update.effective_chat.title
-    chat_type = update.effective_chat.type
-    admin_ids = lookup_admin_ids(chat_id)
-    chat_name_dict = get_chat_ids_and_names()
-    member = update.chat_member
-    user = member.new_chat_member.user
-    user_name = user.first_name + (" " + user.last_name if user.last_name else "")
-    username = user.username
-    user_id = user.id
-    status_change = member.difference().get("status")
-    old_is_member, new_is_member = member.difference().get("is_member", (None, None))
-    
+
+    def is_admin_or_whitelist(user_id, new_status, whitelist_set, shin_ids):
+        if new_status in ["administrator", "creator"] or \
+            user_id in AUTHORIZED_ADMINS or \
+            user_id in whitelist_set or \
+            user_id in shin_ids:
+            logging.info(f"REALTIME: Admin, whitelisted, or special user {user_name} ({user_id}) joined {chat_name}. Ignoring.")
+            return True
+        else:
+            return False
+
+    global chat_admins_cache
+
+    # Early return if the update doesn't concern a status change
+    status_change = update.chat_member.difference().get("status")
     if status_change is None:
-        return None
+        return
     
-    # If the user status went from 'non-member' to 'member,' record as new user in the database.
+    # Determine if the user has transitioned from non-member to member
     old_status, new_status = status_change
-    was_member = old_status in [
-        ChatMember.MEMBER,
-        ChatMember.OWNER,
-        ChatMember.ADMINISTRATOR,
-    ] or (old_status == ChatMember.RESTRICTED and old_is_member is True)
-    is_member = new_status in [
-        ChatMember.MEMBER,
-        ChatMember.OWNER,
-        ChatMember.ADMINISTRATOR,
-    ] or (new_status == ChatMember.RESTRICTED and new_is_member is True)
+    was_member = old_status in ["member", "administrator", "creator"]
+    is_member = new_status in ["member", "administrator", "creator"]
+
+    # If the status change is not someone joining or leaving the chat, return early
+    if not (not was_member and is_member) and not (not is_member and was_member):
+        return
+
+    chat_id, chat_name = update.effective_chat.id, update.effective_chat.title
+    chat_type = update.effective_chat.type
+    new_chat_member = update.chat_member.new_chat_member
+    
+    user_id = new_chat_member.user.id
+    user_name = " ".join(filter(None, [new_chat_member.user.first_name, new_chat_member.user.last_name]))
+    username = new_chat_member.user.username
+
+    shin_ids = set(keyword_search_from_db('shinanygans'))
+    whitelist_set = {entry[0] for entry in get_whitelist(chat_id)}
+    chat_name_dict = get_chat_ids_and_names()
 
     try:
-        whitelist_data = get_whitelist(chat_id)
+        # Proceed with this block if a user who was already in the group changes status
+        if was_member and is_member:
 
-        # Convert user_data and admin_ids into sets for faster lookups
-        whitelist_set = {entry[0] for entry in whitelist_data}
-        
-        if not was_member and is_member:
-            participant = await telethon.get_entity(user_id)
-            member_record_dict = lookup_group_member(user_id, chat_id)
-            member_record_dict = member_record_dict[0] if len(member_record_dict) > 0 else None
-            update_or_insert_chat_member(participant, chat_id, status='Member')
+            # If user just became an admin, add to cached admins
+            if old_status not in ["administrator"] and new_status in ["administrator"]:
+                chat_admins_cache[chat_id].add(user_id)
 
-            if not member.old_chat_member.status in ["administrator", "creator"] and not member.new_chat_member.status in ["administrator", "creator"]:
-                obligation_chat_id = lookup_obligation_chat(chat_id)
-                obligation_chat_name = chat_name_dict.get(obligation_chat_id) if obligation_chat_id else ''
-                insert_user_in_db(user_id, chat_id, "user_activity")
-                shin_ids = set(keyword_search_from_db('shinanygans'))
-                shinfree = True if user_id not in shin_ids else False
-                supergroup = True if chat_type == ChatType.SUPERGROUP or chat_type == ChatType.CHANNEL else False
-                obligation_member = None
-                obligation_found = ''
-                if obligation_chat_id and supergroup and user_id not in AUTHORIZED_ADMINS and user_id not in whitelist_set and shinfree:
-                    obligation_member = await context.bot.get_chat_member(obligation_chat_id, user_id)
-                    if not obligation_member or not hasattr(obligation_member, 'status') or obligation_member.status not in [ ChatMember.MEMBER,
-                                                                                                                             ChatMember.ADMINISTRATOR,
-                                                                                                                             ChatMember.OWNER
-                                                                                                                           ]:       
-                        await obligation_kick(user_id, chat_id, chat_type, user_name, obligation_chat_name)
-                        update_or_insert_chat_member(participant, chat_id, "last_kicked", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
 
-                        obligation_found = ' - NOT FOUND)'
-                    else:
-                        obligation_found = ' - FOUND)'
+            # If user is no longer an admin, remove from cached admins
+            if old_status in ["administrator", "creator"] and new_status not in ["administrator"]:
+                chat_admins_cache[chat_id].discard(user_id)
 
-                    logging.warning(f"REALTIME: {chat_id} -- {user_name} ({user_id}, @{username}) "
-                    f"joining {chat_name}. Previous DB Status: {member_record_dict['status'] if member_record_dict else 'NOT FOUND'} "
-                    f"{'(OBLIGATION: '+ obligation_chat_name if obligation_chat_id else '' } {obligation_found if obligation_found else ''}"
-                    )
-            else:
-                logging.info(f"REALTIME: User ID {user_id} '{user_name}' entered chat {chat_id} '{chat_name}'. Admin. Ignoring.")
-        if (not is_member and was_member) and user_id != context.bot.id and not kick_started:
-            participant = await telethon.get_entity(user_id)
-            update_or_insert_chat_member(participant, chat_id, "last_left", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
+        # Proceed with this block if there has been a transition to being a member (joined group)
+        elif not was_member and is_member:
+
+            # No matter the admin status, log the joining of the group in the 
+            update_or_insert_group_member(chat_id, new_chat_member, EventType.JOINED)
+            
+            # Ignore admins, whitelisted users, or special IDs
+            if is_admin_or_whitelist(user_id, new_status, whitelist_set, shin_ids):
+                return
+
+            # Record the user in the user_activity database
+            insert_user_in_db(user_id, chat_id, "user_activity")
+            
+            # Process obligation kick for non-admin members of supergroups
+            if chat_type in [ChatType.SUPERGROUP, ChatType.CHANNEL]:
+                await process_realtime_obligation_kick(context, chat_id, user_id, user_name, username, chat_name_dict)
+
+        # Proceed with this block if there has been a transition to no longer being a member (left group)
+        elif (not is_member and was_member): 
+
+            # If a kick is started, ignore. The kick functionality will do the database updates
+            if user_id == context.bot.id or kick_started:
+                return
+            
+            if new_status == 'kicked':  #User was banned manually by an admin
+                logging.warning(f"REALTIME: {chat_id} -- {user_name} (@{username}, {user_id}) removed from {chat_name}."
+            )
+                # Because we're not sure if the user was kicked or banned, we will rely on the next room scan to set the database status
+                return 
+
+            #  No matter the admin status, log the leaving of the group 
+            update_or_insert_group_member(chat_id, new_chat_member, EventType.LEFT)
             update_left_groups()
 
-            if not member.new_chat_member.status in ["administrator", "creator"]:
-                delete_user_from_db(user_id, chat_id, "user_activity")
-                ban_leavers_mode = get_ban_leavers_status(chat_id)
-                #If ban_leavers_mode is on, ban anyone with a status of "left"
-                excused = any([user_id == user and chat_id == chat for user, chat in let_leave_without_banning])
-                shin_ids = set(keyword_search_from_db('shinanygans'))
-                shinfree = True if user_id not in shin_ids else False
-                member = lookup_group_member(user_id, chat_id)
-                status = member[0]['status'] if member else None
-                logging.warning(f"REALTIME: {chat_id} -- {user_name} (@{username}, {user_id}) leaving {chat_name}. Chat status is: {new_status}. "
-                    f"Ban Leavers mode is {'ON' if ban_leavers_mode[0]==1 else 'OFF'}. "
-                    f"Obligation kick hallpass list: {let_leave_without_banning}"
-                )
-                if ban_leavers_mode[0]==1 and user_id not in AUTHORIZED_ADMINS and user_id not in admin_ids and user_id not in whitelist_set and not excused and shinfree:
-                    left_user_ids = [user_id]
-                    if status == "Kicked":
-                        logging.warning(f"REALTIME: BAN-LEAVERS MODE ON FOR {chat_id}, BUT {user_name} ALREADY KICKED. DOING NOTHING.")
-                    else:
-                        logging.warning(f"REALTIME: BAN-LEAVERS MODE ON FOR {chat_id} - UNI-BANNING {user_name}")
-                        await uniban_from_list(left_user_ids, reason = f'REALTIME - LEFT {chat_name} WHILE NO-LEAVERS MODE ON')
-                    update_or_insert_chat_member(participant, chat_id, "last_banned", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
-                elif ban_leavers_mode[0]==1 and excused:
-                    logging.warning(f"REALTIME: {user_name} KICKED FROM {chat_name} FOR NOT BELONGING TO OBLIGATION CHAT.")
-                let_leave_without_banning.discard((user_id, chat_id))
+            # No further processing is needed for admins, whitelisted users, or special IDs
+            if is_admin_or_whitelist(user_id, new_status, whitelist_set, shin_ids):
+                return
 
-    except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
+            # Remove the user from the user_activity database (media posting info erased when user leaves)
+            delete_user_from_db(user_id, chat_id, "user_activity")
+
+            # If ban_leavers_mode is on, ban anyone with a status of "left"
+            ban_leavers_mode = get_ban_leavers_status(chat_id)
+
+            logging.warning(f"REALTIME: {chat_id} -- {user_name} (@{username}, {user_id}) leaving {chat_name}. Chat status is: {new_status}. "
+                f"Ban Leavers mode is {'ON' if ban_leavers_mode[0]==1 else 'OFF'}. "
+                f"Obligation kick hallpass list: {let_leave_without_banning}"
+            )
+            if ban_leavers_mode[0]==1:
+                process_realtime_ban_leavers(new_chat_member, new_status, chat_id, user_id, user_name, username, chat_name_dict)
+
+    except (BadRequest, Forbidden) as e:
         logging.warning(f"PRIVATE ERROR in handle_new_member() - {chat_name} may no longer be active")
 
-    except (TimeoutError, TimedOut, NetworkError) as e:
+    except (TimeoutError, NetworkError) as e:
         logging.error(f"Timeout error in the handle_new_member() function: {e}")
 
     except ValueError:
@@ -2056,12 +2220,9 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exc_type, exc_value, exc_traceback = sys.exc_info()
         await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
         logging.error(f"Error in the handle_new_member() function: {e}")
-
     return
 
 
-# Check if it's a media message (photo, video, etc.) and update user activity
-@authorized_chat_check
 async def handle_message(update: Update, context: CallbackContext): 
     rt = 0
     await check_telethon_connection()
@@ -2071,16 +2232,16 @@ async def handle_message(update: Update, context: CallbackContext):
         try:          
             chat_type = update.effective_chat.type
             # Kickbot private chats do not process ordinary messages.
-            if chat_type == ChatType.PRIVATE:
-                if update.message.from_user.id in AUTHORIZED_ADMINS and update.message.document and update.message.document.file_name == "blacklist.csv":
-                    await handle_blacklist_import(update, context)
-                    return
+            #if chat_type == ChatType.PRIVATE:
+            #    if update.message.from_user.id in AUTHORIZED_ADMINS and update.message.document and update.message.document.file_name == "blacklist.csv":
+            #        await handle_blacklist_import(update, context)
+            #        return
 
             chat_id = update.effective_message.chat_id
             chat_name = update.effective_chat.title
             user = update.effective_user
             user_id = user.id
-            user_name = user.first_name + (" " + user.last_name if user.last_name else "")
+            user_name = " ".join(filter(None, [user.first_name, user.last_name]))
 
             # No matter what the message contains, capture the sender in the DB 
             insert_user_in_db(user_id, chat_id, "user_activity")
@@ -2092,6 +2253,7 @@ async def handle_message(update: Update, context: CallbackContext):
                 chat_member = None
                 try:
                     chat_member = await context.bot.get_chat_member(chat_id, user_id)
+                    update_or_insert_group_member(chat_id, chat_member, EventType.POSTED)
                 except Exception as e:
                     logging.error(f"Exception in handle_message() looking up chat member: {e}. Proceeding as if not an admin.")
                 # If the sender was not an admin, update the last_activity in the database
@@ -2101,11 +2263,6 @@ async def handle_message(update: Update, context: CallbackContext):
 
                 else:
                     logging.info(f"User ID {user_id} '{user_name}' in chat {chat_id} '{chat_name}' contains acceptable media but is an admin. Ignoring.")
-                
-                # Get the telethon chat member information in order to update the internal member database.
-                async for participant in telethon.iter_participants(chat_id, search=user.first_name):
-                    if participant.id == user_id:
-                        update_or_insert_chat_member(participant, chat_id, "last_posted", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
             break
 
         except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
@@ -2127,7 +2284,7 @@ async def handle_message(update: Update, context: CallbackContext):
             break     
     return
 
-
+'''
 async def import_blacklist_callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         query = update.callback_query
@@ -2158,7 +2315,7 @@ async def import_blacklist_callback_query_handler(update: Update, context: Conte
         await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
         logging.error(f"Error handling callback query: {e}")
     return
-
+'''
 # ********* WHITELISTING *********
 
 
@@ -2195,7 +2352,7 @@ async def whitelist_user(update: Update, context: CallbackContext):
 
         user = await telethon.get_entity(lookup_id)
         user_id = user.id
-        user_name = user.first_name + (" " + user.last_name if user.last_name else "")
+        user_name = " ".join(filter(None, [user.first_name, user.last_name]))
         insert_user_in_db(user_id, chat_id, "whitelist")
         logging.warning(f"{user_name} has been whitelisted in {chat_name}")
         if chat_id in DEBUG_CHATS:
@@ -2244,7 +2401,7 @@ async def dewhitelist_user(update: Update, context: CallbackContext):
             lookup_id = context.args[0]
         user = await telethon.get_entity(lookup_id)
         user_id = user.id
-        user_name = user.first_name + (" " + user.last_name if user.last_name else "")
+        user_name = " ".join(filter(None, [user.first_name, user.last_name]))
         delete_user_from_db(user_id, chat_id, "whitelist")
         logging.warning(f"{user_name} has been de-whitelisted from {chat_name}")
         if chat_id in DEBUG_CHATS:
@@ -2307,7 +2464,7 @@ async def show_whitelist(update: Update, context: CallbackContext):
             whitelist_message += f"{title.upper()}\n"
             for user_id in user_ids:
                 user_entity = await telethon.get_entity(user_id)
-                user_name = user_entity.first_name + (" " + user_entity.last_name if user_entity.last_name else "")
+                user_name = " ".join(filter(None, [user_entity.first_name, user_entity.last_name]))
                 whitelist_message += f"{user_name} ({user_id})\n"
             whitelist_message += "\n"
         if chat_id in DEBUG_CHATS:
@@ -2352,7 +2509,7 @@ async def process_user_batch(batch, context, issuer_chat_id, issuer_chat_type, i
                         action = 'KICKED'
                     else:
                         await context.bot.ban_chat_member(issuer_chat_id, user_id)
-                        insert_kicked_user_in_blacklist(user_id, issuer_chat_id)
+                        # insert_kicked_user_in_blacklist(user_id, issuer_chat_id)
                         banned_uids.append(user_id)
                         if three_strikes_ban:
                             action = 'BANNED (THIRD STRIKE)'
@@ -2417,7 +2574,7 @@ async def assemble_banned_list(chat_id, admin_ids, cutoff_date):
                 await check_telethon_connection()
                 async for user in telethon.iter_participants(chat_id):
                     user_id = user.id
-                    user_name = f"{user.first_name}{' ' + user.last_name if user.last_name else ''}"
+                    user_name =  " ".join(filter(None, [user.first_name, user.last_name]))
                     username = user.username
                     is_member = isinstance(user.participant, ChannelParticipant) or isinstance(user.participant, ChatParticipant)
 
@@ -2624,45 +2781,6 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
     return
 
 
-async def print_profile_stats(update, context):
-    global profiler
-    try:
-        # Stop the profiler temporarily to generate stats
-        profiler.disable()
-        s = io.StringIO()
-        ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
-        ps.print_stats(50)
-        
-
-        # Filtering and printing the stats
-        stats_message = ""
-        for func_info, func_stats in ps.stats.items():
-            func_path, line_no, func_name = func_info
-            func_path = os.path.abspath(func_path)
-
-            if func_path == kickbot_path:
-                total_calls, total_recursive_calls, total_time, cumulative_time, callers = func_stats
-                stats_message += f"{int(total_calls)} - {int(total_recursive_calls)} - {'{:.4f}'.format(total_time)} - {'{:.4f}'.format(cumulative_time)} - {next(iter(callers))[2]} - {next(iter(callers))[1]}\n"
-
-        # Calculate the number of parts the message would be split into
-        num_parts = len(stats_message) // 4096 + (1 if len(stats_message) % 4096 > 0 else 0)
-
-        if num_parts > 3:
-            await update.message.reply_text("Too much data to return. Please refine your request.")
-        else:
-            for i in range(0, len(stats_message), 4096):  # Telegram's max message length is 4096 chars
-                await update.message.reply_text(stats_message[i:i+4096])
-        
-        # Clear the StringIO buffer
-        s.close()
-
-        # Restart the profiler for continuous profiling
-        profiler.enable()
-    except Exception as e:
-        logging.warning(f"Error printing profilier stats: {e}")
-    return
-
-
 # ********* ASYNCIO TASK CREATION FUNCTIONS *********
 
 
@@ -2769,19 +2887,20 @@ async def show_wholeft_loop(update: Update, context: CallbackContext):
     asyncio.create_task(show_wholeft(update, context))
     return
 
+'''
 #Command to purch the database of data from chats that are no longer active
 @authorized_admin_check
 async def get_blacklist_loop(update: Update, context: CallbackContext):
     asyncio.create_task(get_blacklist(update, context))
     return
-
-
+'''
+'''
 #Command to purch the database of data from chats that are no longer active
 @authorized_admin_check
 async def ban_from_blacklist_loop(update: Update, context: CallbackContext):
     asyncio.create_task(ban_from_blacklist(update, context))
     return
-
+'''
 
 #Command to purch the database of data from chats that are no longer active
 @is_admin_of_authorized_chat_check
@@ -2795,14 +2914,15 @@ async def set_backup_loop(update: Update, context: CallbackContext):
     asyncio.create_task(set_backup(update, context))
     return
 
-
+'''
 async def import_blacklist_callback_query_handler_loop(update: Update, context: CallbackContext):
     asyncio.create_task(import_blacklist_callback_query_handler(update, context))
     return
+'''
 
-@authorized_admin_check
-async def profiler_loop(update: Update, context: CallbackContext):
-    asyncio.create_task(print_profile_stats(update, context))
+@authorized_chat_check
+async def handle_message_loop(update: Update, context: CallbackContext):
+    asyncio.create_task(handle_message(update, context))
     return
 
 
@@ -2827,18 +2947,28 @@ async def restart(update, context):
         logging.error(f"Failed to restart the bot: {e}")
 
 
+
+
 # ********* MAIN *********
 
 
 async def post_init(application: Application):
     await start_chat_member_tracking()  
+    asyncio.create_task(cache_admins_on_startup())
     # asyncio.get_event_loop().set_debug(True)
+
+async def cache_admins_on_startup():
+    db_chats = list_chats_in_db()
+    for db_chat in db_chats:
+        await update_chat_admins_cache(db_chat)
+        # ids = lookup_admin_ids(chat_id=db_chat)
+        # chat_admins_cache[db_chat] = ids
+    return
 
 def main() -> None:
     """Run bot."""
     global kickbot
     global app
-    global profiler
 
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -2847,13 +2977,13 @@ def main() -> None:
     application.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
     application.add_handler(CommandHandler("quietkick", quiet_kick_loop))
     application.add_handler(CommandHandler("inactiveban", inactive_ban_loop))
-
     application.add_handler(CommandHandler("wl_add", whitelist_user_loop))
     application.add_handler(CommandHandler("wl", show_whitelist_loop))
     application.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
-
     application.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
+
     application.add_handler(CommandHandler("lurkinfo", lookup_loop))  
+
     application.add_handler(CommandHandler("log", request_log_loop))     
     application.add_handler(CommandHandler("gcstats", chat_status_loop)) 
     application.add_handler(CommandHandler("start", start_command))
@@ -2864,16 +2994,15 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop_chat_member_tracking))
     application.add_handler(CommandHandler("wholeft", show_wholeft_loop))
     application.add_handler(CommandHandler("noleavers", ban_leavers_mode_loop))
-    application.add_handler(CommandHandler("blacklist", get_blacklist_loop))
-    application.add_handler(CommandHandler("blban", ban_from_blacklist_loop))
+    # application.add_handler(CommandHandler("blacklist", get_blacklist_loop))
+    # application.add_handler(CommandHandler("blban", ban_from_blacklist_loop))
     application.add_handler(CommandHandler("forgive", unban_loop))
     application.add_handler(CommandHandler("setbackup", set_backup_loop)) 
     application.add_handler(CommandHandler("restart", restart)) 
     application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
-    application.add_handler(CallbackQueryHandler(import_blacklist_callback_query_handler_loop, pattern='^blacklist_import_.*'))
+    # application.add_handler(CallbackQueryHandler(import_blacklist_callback_query_handler_loop, pattern='^blacklist_import_.*'))
 
-    application.add_handler(CommandHandler("profiler", profiler_loop)) 
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
     application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
     application.add_error_handler(error)
 
@@ -2882,7 +3011,6 @@ def main() -> None:
     try:
         kickbot = application.bot
         app = application
-        profiler.enable()
         if API_ID and API_HASH:
             global telethon
             telethon = TelegramClient('memberlist_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)

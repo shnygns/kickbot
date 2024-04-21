@@ -10,3 +10,6 @@ test*
 preview*
 client*
 *.csv
+*deprecated*
+*test*
+.env

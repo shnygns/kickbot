@@ -2,7 +2,7 @@ import sqlite3
 import pytz
 import csv
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from config import DATABASE_PATH
 from telegram.constants import ChatType
 from telegram import ChatMember
@@ -15,6 +15,14 @@ from telethon.tl.types import (
     ChatParticipantAdmin, 
     ChatParticipantCreator
 )
+from enum import Enum
+
+class EventType(Enum):
+    JOINED = "joined"
+    LEFT = "left"
+    KICKED = "kicked"
+    BANNED = "banned"
+    POSTED = "posted"
 
 utc_timezone = pytz.utc
 
@@ -68,7 +76,8 @@ def initialize_db():
                 three_strikes_mode BOOLEAN DEFAULT FALSE,
                 ban_leavers_mode BOOLEAN DEFAULT FALSE,
                 obligation_chat INTEGER,
-                last_scan TIMESTAMP
+                last_scan TIMESTAMP,
+                last_admin_update TIMESTAMP
             )
         """
         )
@@ -88,6 +97,9 @@ def initialize_db():
         if 'chat_name' not in columns:
             # If the column doesn't exist, add it to the table
             cursor.execute(f"ALTER TABLE authorized_chats ADD COLUMN chat_name STRING")
+        if 'last_admin_update' not in columns:
+            # If the column doesn't exist, add it to the table
+            cursor.execute(f"ALTER TABLE authorized_chats ADD COLUMN last_admin_update TIMESTAMP")
 
 
         # Create the index on user_id and channel_id
@@ -193,16 +205,6 @@ def insert_authorized_chat(chat_id, chat_name):
     return
 
 
-def delete_authorized_chat(chat_id):
-    try:
-        with sqlite3.connect(DATABASE_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM authorized_chats WHERE chat_id = ?", (chat_id,))
-            conn.commit()
-    except Exception as e:
-        print(f"Error deleting authorized chat: {e}")
-    return
-
 def get_chat_ids_and_names():
     try:
         chat_info = {}
@@ -221,35 +223,18 @@ def get_chat_ids_and_names():
 
 # ********* USER ACTIVITY COMMANDS *********
 
-# Add user_id / chat_id combination to the database
 def insert_user_in_db(user_id, chat_id, table):
     with sqlite3.connect(DATABASE_PATH) as conn:
         cursor = conn.cursor()
-        conn.execute('BEGIN')
 
-        # Check if the specific combination of user_id and chat_id already exists
-        cursor.execute(
-            f"""
-            SELECT 1 FROM {table}
-            WHERE user_id = {user_id} AND channel_id = {chat_id}
-            LIMIT 1
-            """
-        )
+        # Using string formatting for table name, ensure table is a trusted value
+        cursor.execute(f"SELECT 1 FROM {table} WHERE user_id = ? AND channel_id = ? LIMIT 1", (user_id, chat_id))
         row = cursor.fetchone()
 
         if not row:
             # The combination doesn't exist, so insert it
-            cursor.execute(
-                f"""
-                INSERT INTO {table} (user_id, channel_id)
-                VALUES ({user_id}, {chat_id})
-                """
-            )
+            cursor.execute(f"INSERT INTO {table} (user_id, channel_id) VALUES (?, ?)", (user_id, chat_id))
             conn.commit()
-            
-        else:
-            # The combination already exists
-            conn.rollback()  # Roll back the transaction to discard the changes
     return
 
 
@@ -466,6 +451,21 @@ def insert_kicked_user_in_kick_db(user_id, chat_id, last_activity_str):
         """, (user_id, chat_id, user_id, chat_id, last_activity_str, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")))
         conn.commit()
     return
+
+
+def lookup_most_recent_kick_timestamp(chat_id):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT MAX(last_kicked)
+            FROM kicked_users
+            WHERE channel_id = ?
+        """, (chat_id,))
+        result = cursor.fetchone()
+    if result and result[0]:
+        return datetime.strptime(result[0], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone)
+    else:
+        return None
 
 
 # ********* WHITELIST COMMANDS *********
@@ -788,43 +788,7 @@ def batch_insert_or_update_chat_member(params):
     return
 
 
-def batch_update_db(user_ids, chat_id, status):
-    if not user_ids:
-        return
-    additional_query_string = ""
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        cursor = conn.cursor()
-            
-        if status == "Left":
-            field = "last_left"
-            additional_query_string = (
-                """
-                , times_left = COALESCE((SELECT times_left FROM group_member WHERE user_id = ? AND chat_id = ?) + 1, 1)
-                """
-            )
-        elif status == "Kicked":
-            field = "last_kicked"
-            additional_query_string = (
-                """
-                , times_kicked = COALESCE((SELECT times_kicked FROM group_member WHERE user_id = ? AND chat_id = ?) + 1, 1)
-                """
-            )
 
-        # Use a prepared statement for better performance
-        update_query = f'''
-            UPDATE group_member
-            SET status = ?, {field} = ? {additional_query_string}
-            WHERE user_id = ? AND chat_id = ?
-        '''
-
-        # Batch execute the prepared statement
-        update_params = [
-            (status, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"), user_id, chat_id, user_id, chat_id)
-            for user_id in user_ids
-        ]            
-        cursor.executemany(update_query, update_params)
-        conn.commit()
-    return
 
 
 def batch_update_joined(user_ids, chat_id):
@@ -920,211 +884,6 @@ def batch_update_banned(user_ids, chat_id):
         cursor.executemany(update_query, update_params)
         conn.commit()
     conn.close
-    return
-
-
-def insert_chat_member(telethon_chat_member, chat_id, status=None):
-    user_id = telethon_chat_member.id
-    user_name = f"{telethon_chat_member.first_name}{' ' + telethon_chat_member.last_name if telethon_chat_member.last_name else ''}"
-    user_username = telethon_chat_member.username
-    is_premium = telethon_chat_member.premium
-    is_verified = telethon_chat_member.verified
-    is_bot = telethon_chat_member.bot
-    is_fake = telethon_chat_member.fake
-    is_scam = telethon_chat_member.scam
-    is_restricted = telethon_chat_member.restricted
-    restriction_reason = telethon_chat_member.restriction_reason if telethon_chat_member.restriction_reason else None
-
-    if status:
-        user_status = status
-    elif not hasattr(telethon_chat_member, 'participant'):
-        user_status = 'Not Available'
-    elif isinstance(telethon_chat_member.participant, ChannelParticipantAdmin):
-        user_status = 'Admin'
-    elif isinstance(telethon_chat_member.participant, ChannelParticipantCreator):
-        user_status = 'Creator'
-    elif isinstance(telethon_chat_member.participant, ChannelParticipant):
-        user_status = 'Member'
-    elif isinstance(telethon_chat_member.participant, ChatParticipantAdmin):
-        user_status = 'Admin'
-    elif isinstance(telethon_chat_member.participant, ChatParticipantCreator):
-        user_status = 'Creator'
-    elif isinstance(telethon_chat_member.participant, ChatParticipant):
-        user_status = 'Member'
-    else:
-        user_status = 'Not Available'
-
-    join_date = telethon_chat_member.participant.date.strftime("%Y-%m-%d %H:%M:%S.%f") if (hasattr(telethon_chat_member, 'participant') and hasattr(telethon_chat_member.participant, 'date')) else None
-
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO group_member (
-                       user_id, 
-                       chat_id, 
-                       user_name, 
-                       user_username, 
-                       is_premium, 
-                       is_verified,
-                       is_bot,
-                       is_fake,
-                       is_scam,
-                       is_restricted,
-                       restricted_reason,
-                       status,
-                       first_joined,
-                       last_joined,
-                       times_joined
-                      )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1 )
-        ''', (user_id, 
-              chat_id, 
-              user_name,
-              user_username,
-              is_premium,
-              is_verified,
-              is_bot,
-              is_fake,
-              is_scam,
-              is_restricted,
-              restriction_reason,
-              user_status,
-              join_date,
-              join_date,
-              ))
-        conn.commit()
-    return
-
-
-def update_or_insert_chat_member(telethon_chat_member, chat_id, field=None, value=None, status=None):
-    user_id = telethon_chat_member.id
-    with sqlite3.connect(DATABASE_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            SELECT first_joined, last_joined FROM group_member
-            WHERE user_id = {user_id} AND chat_id = {chat_id}
-            LIMIT 1
-            """
-        )
-        row=cursor.fetchone()
-        preexisting_last_joined_date = None
-        if row:
-            if row[1]:
-                 preexisting_last_joined_date = row[1]
-            elif row[0]:
-                 preexisting_last_joined_date = row[0]
-                
-        if hasattr(telethon_chat_member, 'participant') and hasattr(telethon_chat_member.participant, 'date'):
-            last_joined = telethon_chat_member.participant.date
-        else:
-            last_joined = preexisting_last_joined_date
-
-        if field == "last_posted":
-            additional_query_string = (
-                f"""
-                , times_posted = COALESCE((SELECT times_posted FROM group_member WHERE user_id = {user_id} AND chat_id = {chat_id}) + 1, 1)
-                """
-            )
-        if field == "last_left":
-            additional_query_string = (
-                f"""
-                , times_left = COALESCE((SELECT times_left FROM group_member WHERE user_id = {user_id} AND chat_id = {chat_id}) + 1, 1)
-                """
-            )
-        if field == "last_banned":
-            additional_query_string = (
-                f"""
-                , times_banned = COALESCE((SELECT times_banned FROM group_member WHERE user_id = {user_id} AND chat_id = {chat_id}) + 1, 1)
-                """
-            )
-        if field == "last_kicked":
-            additional_query_string = (
-                f"""
-                , times_kicked = COALESCE((SELECT times_kicked FROM group_member WHERE user_id = {user_id} AND chat_id = {chat_id}) + 1, 1)
-                """
-            )
-        # last_joined = None
-        if field == 'last_left':
-            user_status = 'Left'
-        elif field == 'last_banned':
-            user_status = 'Banned'
-        elif field == 'last_kicked':
-            user_status = 'Kicked'
-        elif status=='Member':
-            user_status=status
-            last_joined = datetime.utcnow()
-        elif status:
-            user_status=status
-        elif not hasattr(telethon_chat_member, 'participant'):
-            user_status = 'Not Available'
-        elif isinstance(telethon_chat_member.participant, ChannelParticipantAdmin):
-            user_status = 'Admin'
-           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
-        elif isinstance(telethon_chat_member.participant, ChannelParticipantCreator):
-            user_status = 'Creator'
-           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
-        elif isinstance(telethon_chat_member.participant, ChannelParticipant):
-            user_status = 'Member'
-           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
-        elif isinstance(telethon_chat_member.participant, ChatParticipantAdmin):
-            user_status = 'Admin'
-           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
-        elif isinstance(telethon_chat_member.participant, ChatParticipantCreator):
-            user_status = 'Creator'
-           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
-        elif isinstance(telethon_chat_member.participant, ChatParticipant):
-            user_status = 'Member'
-           # last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
-        else:
-            user_status = 'Not Available'
-            #last_joined = telethon_chat_member.participant.date if hasattr(telethon_chat_member.participant, 'date') else None
-
-        if isinstance(last_joined, datetime):
-            last_joined = last_joined.strftime('%Y-%m-%d %H:%M:%S.%f') 
-        
-
-        # Check if the specific combination of user_id and chat_id already exists
-        cursor.execute(
-            f"""
-            SELECT 1 FROM group_member
-            WHERE user_id = {user_id} AND chat_id = {chat_id}
-            LIMIT 1
-            """
-        )
-        row = cursor.fetchone()
-
-        if not row and status:
-            insert_chat_member(telethon_chat_member, chat_id)
-            cursor.execute(
-            f"""
-            UPDATE group_member
-            SET status = ?
-            WHERE user_id = ? AND chat_id = ?
-            """,
-            (user_status, user_id, chat_id),
-        )               
-        elif not row:
-            insert_chat_member(telethon_chat_member, chat_id)
-        elif field is None:
-            cursor.execute(
-                f"""
-                UPDATE group_member
-                SET last_joined = ?, status = ?, times_joined = COALESCE((SELECT times_joined FROM group_member WHERE user_id = ? AND chat_id = ?) + 1, 1)
-                WHERE user_id = ? AND chat_id = ?
-                """,
-                (last_joined, user_status, user_id, chat_id, user_id, chat_id),
-            )  
-        else:
-             cursor.execute(
-                f"""
-                UPDATE group_member
-                SET {field} = ?, status = ? {additional_query_string}     
-                WHERE user_id = ? AND chat_id = ?
-                """,
-                (value, user_status, user_id, chat_id),
-            )      
-        conn.commit()
     return
 
 
@@ -1445,6 +1204,33 @@ def lookup_last_scan(chat_id):
     return last_scan_datetime
 
 
+def insert_last_admin_update(chat_id, last_update=None):
+    if last_update is None:
+        last_update = datetime.now(timezone.utc)
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE authorized_chats SET last_admin_update = ? WHERE chat_id = ?
+        ''', (last_update.strftime("%Y-%m-%d %H:%M:%S.%f"), chat_id))
+        conn.commit()
+    return
+
+
+def lookup_last_admin_update(chat_id):
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT last_admin_update
+            FROM authorized_chats
+            WHERE chat_id = ?
+        ''', (chat_id, ))
+        last_admin_update = cursor.fetchone()
+        last_admin_update_datetime = None
+        if last_admin_update and last_admin_update[0]:
+            last_admin_update_datetime = datetime.strptime(last_admin_update[0], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone)
+    return last_admin_update_datetime
+
+
 def import_blacklist_from_csv(csv_filename):
     try:
         with open(csv_filename, 'r', newline='') as csv_file:
@@ -1465,3 +1251,228 @@ def import_blacklist_from_csv(csv_filename):
     except Exception as e:
         logging.error(f"Error importing blacklist data: {e}")
         return []
+    
+
+def extract_user_data(user_obj):
+    user_data = {
+        'status': 'Not Available'
+    }
+    if hasattr(user_obj, 'id'):  # Telethon User object, produced by either get_entity() or iter_participants()
+        user_data['id'] = user_obj.id
+        user_data['first_name'] = user_obj.first_name
+        user_data['last_name'] = user_obj.last_name
+        user_data['full_name'] = f"{user_obj.first_name}{' ' + user_obj.last_name if user_obj.last_name else ''}"
+        user_data['username'] = user_obj.username
+        user_data['premium'] = user_obj.premium
+        user_data['verified'] = user_obj.verified
+        user_data['deleted'] = user_obj.deleted
+        user_data['bot'] = user_obj.bot
+        user_data['fake'] = user_obj.fake
+        user_data['scam'] = user_obj.scam
+        user_data['restricted'] = user_obj.restricted
+        user_data['restricted_reason'] = user_obj.restriction_reason if user_obj.restriction_reason else None
+
+        if hasattr(user_obj, 'participant'): #Produced by iter_participants()
+            participant = user_obj.participant
+            user_data['join_date'] = participant.date if  hasattr(participant, 'date') else None
+            user_data['join_date_string'] = participant.date.strftime("%Y-%m-%d %H:%M:%S.%f") if hasattr(participant, 'date') else None
+            if isinstance(participant, ChannelParticipantAdmin) or isinstance(participant, ChatParticipantAdmin):
+                user_data['status'] = "Admin"
+            elif isinstance(participant, ChannelParticipantCreator) or isinstance(participant, ChatParticipantCreator):
+                user_data['status'] = "Creator"
+            elif isinstance(participant, ChannelParticipant) or isinstance(participant, ChatParticipant):
+                user_data['status'] = "Member"
+
+
+    elif hasattr(user_obj, 'status'):  #Python-telegram-bot ChatMember Object
+        user = user_obj.user
+        user_data['id'] = user.id
+        user_data['first_name'] = user.first_name
+        user_data['last_name'] = user.last_name
+        user_data['full_name'] = f"{user.first_name}{' ' + user.last_name if user.last_name else ''}"
+        user_data['username'] = user.username
+        user_data['premium'] = user.is_premium
+        user_data['bot'] = user.is_bot
+
+        if user_obj.status in ["administrator"]:
+            user_data['status'] = "Admin"
+        elif user_obj.status in ["kicked"]:
+            user_data['status'] = "Banned"
+        elif user_obj.status in ["left"]:
+            user_data['status'] = "Left"
+        elif user_obj.status in ["member"]:
+            user_data['status'] = "Member"
+        elif user_obj.status in ["creator"]:
+            user_data['status'] = "Creator"
+        else:
+            user_data['status'] = "Not Available"
+    else:
+        raise ValueError("Unsupported user object type")
+    return user_data
+
+
+
+def update_or_insert_group_member(chat_id, tg_object, event:EventType=None, join_date=None):
+    user_data = extract_user_data(tg_object)
+    user_id = user_data.get('id')
+    user_status = user_data.get('status')
+    now_string = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    # Discover whether user has an existing record with a first_joined or last_joined datestamp
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT first_joined, last_joined FROM group_member
+            WHERE user_id = ? AND chat_id = ?
+            LIMIT 1
+            """, (user_id, chat_id)
+        )
+        row=cursor.fetchone()
+        preexisting_last_joined_date = None
+        if row:
+            if row[1]:
+                 preexisting_last_joined_date = row[1] # last_joined field from existing record
+            elif row[0]:
+                 preexisting_last_joined_date = row[0] # first_joined field from existing record
+
+        # If a last_joined date is present in user_data, use that. Otherwise, use pre-existing database timestamps, otherwise use now
+        user_data_joined_date = user_data.get('join_date_string')
+        if join_date:
+            last_joined = join_date.strftime("%Y-%m-%d %H:%M:%S.%f")
+        elif user_data_joined_date:
+            last_joined = user_data_joined_date
+        elif preexisting_last_joined_date:
+            last_joined = preexisting_last_joined_date
+        else:
+            last_joined = now_string
+
+
+        # Check if the specific combination of user_id and chat_id already exists
+        cursor.execute(
+            f"""
+            SELECT status FROM group_member
+            WHERE user_id = {user_id} AND chat_id = {chat_id}
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+
+        # If chat status could not be determined fromt he telegram object, retain the status that currently exists in the database
+        if row and user_status == 'Not Available':
+            user_status = row[0]
+
+        # If no record for the user_id/chat_id, create one and update status 
+        if not row:
+            insert_or_replace_group_member_with_user_data(chat_id, user_data) 
+
+        elif event == EventType.JOINED:  #Rejoining group, execute only if record currently exists
+                cursor.execute(
+                    f"""
+                    UPDATE group_member
+                    SET last_joined = ?, status = ?, times_joined = COALESCE((SELECT times_joined FROM group_member WHERE user_id = ? AND chat_id = ?) + 1, 1)
+                    WHERE user_id = ? AND chat_id = ?
+                    """,
+                    (last_joined, user_status, user_id, chat_id, user_id, chat_id)
+                )       
+
+        # Depending on the event, update dates and counts in database
+        # If the event is something other than JOINED, it's block needs to run whether the record previously existed or was just created
+        if event == EventType.POSTED:
+            cursor.execute(
+                f"""
+                UPDATE group_member
+                SET last_posted = ?, status = ? , times_posted = COALESCE((SELECT times_posted FROM group_member WHERE user_id = ? AND chat_id = ?) + 1, 1)
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (now_string, user_status, user_id, chat_id, user_id, chat_id)
+            )  
+                
+        elif event == EventType.LEFT:
+            cursor.execute(
+                f"""
+                UPDATE group_member
+                SET last_left = ?, status = ? , times_left = COALESCE((SELECT times_left FROM group_member WHERE user_id = ? AND chat_id = ?) + 1, 1)
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (now_string, user_status, user_id, chat_id, user_id, chat_id)
+            )  
+                            
+        elif event == EventType.KICKED:
+            cursor.execute(
+                f"""
+                UPDATE group_member
+                SET last_kicked = ?, status = ? , times_kicked = COALESCE((SELECT times_kicked FROM group_member WHERE user_id = ? AND chat_id = ?) + 1, 1)
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (now_string, user_status, user_id, chat_id, user_id, chat_id)
+            )    
+            
+        elif event == EventType.BANNED:
+            cursor.execute(
+                f"""
+                UPDATE group_member
+                SET last_banned = ?, status = ? , times_banned = COALESCE((SELECT times_banned FROM group_member WHERE user_id = ? AND chat_id = ?) + 1, 1)
+                WHERE user_id = ? AND chat_id = ?
+                """,
+                (now_string, user_status, user_id, chat_id, user_id, chat_id)
+            )    
+
+        conn.commit()
+    return
+
+def insert_or_replace_group_member_with_user_data(chat_id, user_data):
+    # Prepare variables from user_data dict
+    user_id = user_data.get('id')
+    user_name = user_data.get('full_name')
+    user_username = user_data.get('username')
+    is_premium = user_data.get('premium')
+    is_verified = user_data.get('verified')
+    is_bot = user_data.get('bot')
+    is_fake = user_data.get('fake')
+    is_scam = user_data.get('scam')
+    is_restricted = user_data.get('restricted')
+    restriction_reason = user_data.get('restriction_reason')
+    user_status = user_data.get('status')
+    join_date_string = user_data.get('join_date_string')
+
+    # Insert or replace record into db
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO group_member (
+                       user_id, 
+                       chat_id, 
+                       user_name, 
+                       user_username, 
+                       is_premium, 
+                       is_verified,
+                       is_bot,
+                       is_fake,
+                       is_scam,
+                       is_restricted,
+                       restricted_reason,
+                       status,
+                       first_joined,
+                       last_joined,
+                       times_joined
+                      )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1 )
+        ''', (user_id, 
+              chat_id, 
+              user_name,
+              user_username,
+              is_premium,
+              is_verified,
+              is_bot,
+              is_fake,
+              is_scam,
+              is_restricted,
+              restriction_reason,
+              user_status,
+              join_date_string,
+              join_date_string,
+              ))
+        conn.commit()
+    return
+
