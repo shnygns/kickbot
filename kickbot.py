@@ -1077,12 +1077,15 @@ async def verify_user_left_chat(user_list, chat_id):
         if not result:
             continue # If the user is not found in the chat, it is unclear what is wrong but they shouldn't be banned
         if result.status in ["member", "administrator", "creator"]:
+            logging.warning(f"SCAN: {result_user_id} ({result.user.full_name}) left the chat {chat_id} but was an administrator.")
             pass
         elif result.status == 'left': # In this condition, the user has left the chat and is rightly subject to ban
+            logging.warning(f"SCAN: {result_user_id} ({result.user.full_name}) is verified to have left {chat_id}.")
             left_user_ids.add(result_user_id)
         elif result.status == 'kicked': # In telethon vocabulary, 'kicked' means banned (i.e. on the 'removed' list).
             batch_update_banned([result_user_id], chat_id)
         else:
+            logging.warning(f"SCAN: {result_user_id} ({result.user.full_name}) has a status of {result.status} in {chat_id}, and was therefore not considered a leaver.")
             pass
 
     return left_user_ids
@@ -2938,7 +2941,7 @@ async def restart(update, context):
     try:
         if update.effective_chat.type != ChatType.PRIVATE:
             return
-        if update.effective_user.id not in [6862368034, 861097305]:
+        if update.effective_user.id not in AUTHORIZED_ADMINS:
             return
         await update.message.reply_text('Bot is restarting...')
         #Thread(target=stop_and_restart).start()
