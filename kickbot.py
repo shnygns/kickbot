@@ -514,9 +514,7 @@ async def uniban_from_list(user_id_list, add_to_bl = True, reason = ''):
             chat = await kickbot.get_chat(chat_id)
             if chat.type == ChatType.PRIVATE:
                 logging.warning(f"Can't ban from {chat_title} - PRIVATE")
-                continue
-
-            logging.warning(f"Banning left users from {chat_title}")         
+                continue     
             for banning_user_id in user_id_list:
                 group_member_dict =  lookup_group_member(banning_user_id, chat_id)
                 group_member_dict = group_member_dict[0] if group_member_dict else None
@@ -1866,25 +1864,29 @@ async def obligation_kick(user_id, chat_id, chat_type, user_name, obligation_cha
 
 # ********* REALTIME CHAT EVENT HANDLING *********
 
-async def process_realtime_obligation_kick(context, chat_id, user_id, user_name, username, chat_name_dict):
+async def process_realtime_obligation_kick(context, chat_id, chat_type, chat_name_dict, chat_member):
     obligation_chat_id = lookup_obligation_chat(chat_id)
     if not obligation_chat_id:
         return
+    
+    user_id = chat_member.user.id
+    user_name = " ".join(filter(None, [chat_member.user.first_name, chat_member.user.last_name]))
+    username = chat_member.user.username
     chat_name = chat_name_dict.get(chat_id) 
     obligation_chat_name = chat_name_dict.get(obligation_chat_id) if obligation_chat_id else ''
     try:
         # Is user a member of the required obligation chat?
         obligation_member = await context.bot.get_chat_member(obligation_chat_id, user_id)
         if obligation_member.status not in ["member", "administrator", "creator"]:
-            await obligation_kick(user_id, chat_id, user_name, obligation_chat_name)
-            update_or_insert_group_member(chat_id, user_id, EventType.KICKED)
+            await obligation_kick(user_id, chat_id, chat_type, user_name, obligation_chat_name)
+            update_or_insert_group_member(chat_id, chat_member, EventType.KICKED)
             logging.warning(f"REALTIME: Obligation kick for {user_name} ({user_id}, @{username}) from {chat_name} for not being in {obligation_chat_name}.")
     except Exception as e:
         logging.error(f"Error checking obligation chat membership for {user_id}: {e}")
     return
 
 
-async def process_realtime_ban_leavers(new_chat_member, new_status, chat_id, user_id, user_name, username, chat_name_dict):
+async def process_realtime_ban_leavers(new_chat_member, new_status, chat_id, user_id, user_name, username, chat_name_dict, ban_leavers_mode):
     # This function executes if ban_leavers_mode is on, and will ban anyone with a status of "left"
     global let_leave_without_banning
     try:   
@@ -1910,7 +1912,7 @@ async def process_realtime_ban_leavers(new_chat_member, new_status, chat_id, use
         else:
             logging.warning(f"REALTIME: {user_name} KICKED FROM {chat_name} FOR NOT BELONGING TO OBLIGATION CHAT.")       
     except Exception as e:
-        logging.error(f"Error checking obligation chat membership for {user_id}: {e}")
+        logging.error(f"Error processing leaver-bans for {user_id}: {e}")
     let_leave_without_banning.discard((user_id, chat_id))
     return
 
@@ -1946,7 +1948,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (not was_member and is_member) and not (not is_member and was_member):
         return
 
-    chat_id, chat_name = update.effective_chat.id, update.effective_chat.title
+    chat_id, chat_name, chat_type = update.effective_chat.id, update.effective_chat.title, update.effective_chat.type
     chat_type = update.effective_chat.type
     new_chat_member = update.chat_member.new_chat_member
     
@@ -1978,6 +1980,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_or_insert_group_member(chat_id, new_chat_member, EventType.JOINED)
             
             # Ignore admins, whitelisted users, or special IDs
+
             if is_admin_or_whitelist(user_id, new_status, whitelist_set, shin_ids):
                 return
 
@@ -1986,7 +1989,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Process obligation kick for non-admin members of supergroups
             if chat_type in [ChatType.SUPERGROUP, ChatType.CHANNEL]:
-                await process_realtime_obligation_kick(context, chat_id, user_id, user_name, username, chat_name_dict)
+                await process_realtime_obligation_kick(context, chat_id, chat_type, chat_name_dict, new_chat_member)
 
         # Proceed with this block if there has been a transition to no longer being a member (left group)
         elif (not is_member and was_member): 
@@ -2016,12 +2019,8 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # If ban_leavers_mode is on, ban anyone with a status of "left"
             ban_leavers_mode = get_ban_leavers_status(chat_id)
 
-            logging.warning(f"REALTIME: {chat_id} -- {user_name} (@{username}, {user_id}) leaving {chat_name}. Chat status is: {new_status}. "
-                f"Ban Leavers mode is {'ON' if ban_leavers_mode[0]==1 else 'OFF'}. "
-                f"Obligation kick hallpass list: {let_leave_without_banning}"
-            )
             if ban_leavers_mode[0]==1:
-                await process_realtime_ban_leavers(new_chat_member, new_status, chat_id, user_id, user_name, username, chat_name_dict)
+                await process_realtime_ban_leavers(new_chat_member, new_status, chat_id, user_id, user_name, username, chat_name_dict, ban_leavers_mode)
 
     except (BadRequest, Forbidden) as e:
         logging.warning(f"PRIVATE ERROR in handle_new_member() - {chat_name} may no longer be active")
@@ -2707,7 +2706,6 @@ async def restart(update, context):
         if update.effective_user.id not in AUTHORIZED_ADMINS:
             return
         await update.message.reply_text('Bot is restarting...')
-        #Thread(target=stop_and_restart).start()
         asyncio.create_task(stop_and_restart())
     except Exception as e:
         logging.error(f"Failed to restart the bot: {e}")
@@ -2727,8 +2725,6 @@ async def cache_admins_on_startup():
     db_chats = list_chats_in_db()
     for db_chat in db_chats:
         await update_chat_admins_cache(db_chat)
-        # ids = lookup_admin_ids(chat_id=db_chat)
-        # chat_admins_cache[db_chat] = ids
     return
 
 def main() -> None:
@@ -2763,8 +2759,9 @@ def main() -> None:
     application.add_handler(CommandHandler("forgive", unban_loop))
     application.add_handler(CommandHandler("setbackup", set_backup_loop)) 
     application.add_handler(CommandHandler("restart", restart)) 
-    application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
 
+    application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
+    
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
     application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
     application.add_error_handler(error)
