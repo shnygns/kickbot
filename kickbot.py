@@ -256,6 +256,8 @@ def authorized_chat_check(handler_function):
         # Check if the chat is authorized based on the SQLite table
         chat_id = update.effective_chat.id
         chat_title = update.effective_chat.title
+
+        # Check if chat is in authorized_chats db table (and update chat_name if none exists); if yes function proceeds
         if is_chat_authorized(chat_id, chat_title):
             return await handler_function(update, context, *args, **kwargs)
         
@@ -283,6 +285,8 @@ def authorized_chat_check(handler_function):
                 admin_ids = {admin.user.id for admin in admins}
                 set_admin_ids = set(admin_ids)
                 set_auth_admins = set(AUTHORIZED_ADMINS)
+
+                # If an authorized (named) admin is one of the chat admins, insert into cache and insert into DB as necessary
                 if set_auth_admins.intersection(set_admin_ids):
                     insert_authorized_chat(chat_id, chat_title)
                     chat_admins_cache[chat_id] = set_admin_ids # Cache admin ids from chat
@@ -386,54 +390,6 @@ async def check_telethon_connection() -> bool:
     attempting_telethon_restart = False
     return telethon.is_connected
 
-'''
-# Validate format of blacklist CSV imports
-def validate_csv_format(csv_filename):
-    try:
-        with open(csv_filename, 'r', newline='') as csv_file:
-            csv_reader = csv.reader(csv_file)
-            header = next(csv_reader)
-            expected_header = ["CHAT ID", "USER ID", "USER NAME", "BAN COUNT", "MOST RECENT BAN"]
-            if header != expected_header:
-                return False
-        return True
-    except Exception as e:
-        logging.error(f"Error validating CSV format: {e}")
-        return False
-
-async def handle_blacklist_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        chat_id = update.effective_chat.id
-        file = await context.bot.get_file(update.message.document.file_id)
-        await file.download_to_drive("blacklist_to_import.csv")
-        
-        # Validate CSV format
-        if not validate_csv_format("blacklist_to_import.csv"):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Invalid CSV file format. The file must contain columns: 'CHAT ID', 'USER ID', 'USER NAME', 'BAN COUNT', 'MOST RECENT BAN'."
-            )
-            return
-        
-        # Ask for confirmation
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Yes", callback_data="blacklist_import_yes")],
-            [InlineKeyboardButton("No", callback_data="blacklist_import_no")]
-        ])
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text="Do you want to import this CSV file into the blacklist?",
-            reply_markup=keyboard
-        )
-        context.user_data[update.effective_user.id] = message.message_id
-    except Forbidden as e:
-        logging.error(f"Error handling blacklist import: {e}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="<i style='color:#808080;'> Please open a chat with the bot to see responses.</i>",
-            parse_mode=ParseMode.HTML
-        )
-'''
 
 # Registered error handler for the app
 async def error(update, context):
@@ -570,8 +526,6 @@ async def uniban_from_list(user_id_list, add_to_bl = True, reason = ''):
                     await kickbot.ban_chat_member(chat_id, banning_user_id)
                 except Exception as e:
                     logging.warning(f"Ban error for {banning_user_id} in {chat_title} - {e}")
-            #if add_to_bl:
-            #    insert_userlist_into_blacklist(user_id_list, chat_id)
 
         except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
             logging.warning(f"Can't ban from {chat_title} - Bad request or private channel error")
@@ -580,37 +534,8 @@ async def uniban_from_list(user_id_list, add_to_bl = True, reason = ''):
             logging.warning(f"Uniban error: {e}")
             continue
     return
-'''
-async def ban_from_imported_blacklist(blacklist_data):
-    async def ban_user(user_id, chat_id):
-        await telethon.edit_permissions(chat_id, user_id, view_messages=False)
-    chat_ids_in_database = list_chats_in_db()
-    for chat_id in chat_ids_in_database:
-        try:
-            admins = chat_admins_cache.get(chat_id)
-            titles = get_chat_ids_and_names()
-            chat_title = titles.get(chat_id)
-            if not admins:
-                await authorize_chat_and_update_cache(chat_id, chat_title)
-            if not await is_user_admin(kickbot.id, chat_id):
-                continue         
-        
-            chat = await kickbot.get_chat(chat_id)
-            banned_users_for_this_chat = [blacklister[0] for blacklister in blacklist_data if blacklister[1] == chat_id]
-            if chat.type == ChatType.PRIVATE:
-                logging.warning(f"Can't ban from {chat.title} - PRIVATE")
-            else:
-                logging.warning(f"Banning blacklisted users from {chat.title}")
 
-                await asyncio.gather(*(ban_user(user_id) for user_id in banned_users_for_this_chat))
-        except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
-            logging.warning(f"Can't ban from {chat.title} - PRIVATE ERROR - May no longer be active")
-            break
-        except Exception as e:
-            logging.warning(f"Ban-from-imported-blacklist error: {e}")
-    return
 
-'''
 async def unban(update: Update=None, context: CallbackContext=None):
     @authorized_admin_check
     async def universal_unban(update: Update=None, context: CallbackContext=None):
@@ -1076,7 +1001,7 @@ async def verify_user_left_chat(user_list, chat_id):
             batch_update_left([user_id_to_be_verified], chat_id)# UPDATE IN DB DIRECTLY WITHOUT FLAGGING AS A LEFT USER FOR BANNING PURPOSES
         if not result:
             continue # If the user is not found in the chat, it is unclear what is wrong but they shouldn't be banned
-        if result.status in ["member", "administrator", "creator"]:
+        if result.status in ["administrator", "creator"]:
             logging.warning(f"SCAN: {result_user_id} ({result.user.full_name}) left the chat {chat_id} but was an administrator.")
             pass
         elif result.status == 'left': # In this condition, the user has left the chat and is rightly subject to ban
@@ -1428,63 +1353,7 @@ async def chat_status(update: Update, context: CallbackContext):
         logging.error(f"Error assembling chat stats: {e}")
     return
 
-'''
-async def ban_from_blacklist(update: Update, context: CallbackContext):
-    chat_id = update.message.chat_id
-    chat_name = update.effective_chat.title
-    issuer_user_id = update.effective_user.id
-    chat_type = update.effective_chat.type
-    if chat_type == ChatType.PRIVATE:
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text="<i style='color:#808080;'> This command only works in the chat where you want to ban everyone on Kickbot's blacklist. The responses will come here.</i>",
-            parse_mode=ParseMode.HTML
-        )       
-        # Schedule a task to delete the message after a few seconds
-        asyncio.create_task(delete_message_after_delay(context, message))
-        return
-    else:
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text="<i style='color:#808080;'> Response will be sent privately.</i>",
-            parse_mode=ParseMode.HTML
-        )
-        asyncio.create_task(delete_message_after_delay(context, message))
 
-        try:
-            blacklist = return_blacklist()
-            if blacklist is None:
-                return
-            logging.warning(f"BANNING BLACKLISTED USERS FROM {chat_name}")
-            await context.bot.send_message(
-            chat_id=issuer_user_id,
-            text=f"BANNING BLACKLISTED USERS FROM {chat_name}"
-        )       
-            blacklisted_uids = []
-            # Use a set to store unique user IDs
-            unique_blacklisted_uids = set(blacklisted_user[0] for blacklisted_user in blacklist)    
-            for uid in unique_blacklisted_uids:
-                try:
-                    await context.bot.ban_chat_member(chat_id, uid)
-                    blacklisted_uids.append(uid)
-                except Exception as e:
-                    logging.warning(f"Could not ban {uid} from {chat_id} - Ban error or deleted account.")
-                insert_kicked_user_in_blacklist(uid, chat_id)
-            batch_update_banned(blacklisted_uids, chat_id)
-            logging.warning(f"BANNING BLACKLIST FROM {chat_name} COMPLETE. BANNED {len(blacklisted_uids)} USERS.")
-            await context.bot.send_message(
-            chat_id=issuer_user_id,
-            text=f"BANNING BLACKLIST FROM {chat_name} COMPLETE. BANNED {len(blacklisted_uids)} USERS."
-        )    
-
-
-        except Exception as e:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-            logging.error(f"Error assembling chat stats: {e}")
-    return
-
-'''
 async def lookup(update: Update, context: CallbackContext):
     chat_id = update.message.chat_id
     issuer_user_id = update.effective_user.id
@@ -1797,63 +1666,6 @@ async def show_wholeft(update: Update, context: CallbackContext):
 
     return
 
-'''
-async def get_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_type = update.effective_chat.type
-    chat_id = update.effective_chat.id
-    issuer_user_id = update.effective_user.id
-    try:
-        if chat_type is not ChatType.PRIVATE:
-            message = await context.bot.send_message(
-                chat_id=chat_id,
-                text="<i style='color:#808080;'> Response will be sent privately.</i>",
-                parse_mode=ParseMode.HTML
-            )
-            asyncio.create_task(delete_message_after_delay(context, message))
-
-        
-        blacklist = return_blacklist() # bl.user_id, bl.channel_id, bl.ban_count, bl.last_banned, gm.user_name
-        csv_filename = "blacklist.csv"
-
-        # Sort the blacklist by chat_id and then by last_banned (newest to oldest)
-        sorted_blacklist = sorted(
-            blacklist,
-            key=lambda x: (
-                x[1],
-                datetime.strptime(x[3], "%Y-%m-%d %H:%M:%S.%f") if x[3] else datetime.min,
-            ),
-            reverse=True
-        )
-
-
-        with open(csv_filename, mode='w', newline='') as csv_file:
-            csv_writer = csv.writer(csv_file)
-            csv_writer.writerow(["CHAT ID", "USER ID", "USER NAME", "BAN COUNT", "MOST RECENT BAN"])
-
-
-        for row in sorted_blacklist:
-            with open(csv_filename, mode='a', newline='') as csv_file:
-                csv_writer = csv.writer(csv_file)
-                csv_writer.writerow([row[1], row[0], row[4], row[2], row[3]])
-
-        with open(csv_filename, 'rb') as csv_file:
-            await context.bot.send_document(chat_id=issuer_user_id, document=csv_file, filename="blacklist.csv")
-
-    except Forbidden as e:
-        logging.error(f"Error in the wholeft printing process: {e}")
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text="<i style='color:#808080;'> Please open a chat with the bot to see responses.</i>",
-            parse_mode=ParseMode.HTML
-        )
-        asyncio.create_task(delete_message_after_delay(context, message))
-    
-    except Exception as e:
-        exc_type, exc_value, exc_traceback = sys.exc_info()
-        await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-        logging.error(f"Error in the blacklist printing process: {e}")
-    return
-'''
 
 async def set_backup(update, context):
     user_id = update.effective_user.id
@@ -2194,6 +2006,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_left_groups()
 
             # No further processing is needed for admins, whitelisted users, or special IDs
+
             if is_admin_or_whitelist(user_id, new_status, whitelist_set, shin_ids):
                 return
 
@@ -2208,7 +2021,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Obligation kick hallpass list: {let_leave_without_banning}"
             )
             if ban_leavers_mode[0]==1:
-                process_realtime_ban_leavers(new_chat_member, new_status, chat_id, user_id, user_name, username, chat_name_dict)
+                await process_realtime_ban_leavers(new_chat_member, new_status, chat_id, user_id, user_name, username, chat_name_dict)
 
     except (BadRequest, Forbidden) as e:
         logging.warning(f"PRIVATE ERROR in handle_new_member() - {chat_name} may no longer be active")
@@ -2287,38 +2100,7 @@ async def handle_message(update: Update, context: CallbackContext):
             break     
     return
 
-'''
-async def import_blacklist_callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        query = update.callback_query
-        chat_id = query.message.chat_id
-        message_id = query.message.message_id
-        user_id = query.from_user.id
-        
-        if query.data == "blacklist_import_yes":
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            bl_data = import_blacklist_from_csv("blacklist_to_import.csv")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Processing bans. Please wait."
-            )
-            await ban_from_imported_blacklist(bl_data)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Blacklist data imported successfully."
-            )
-        elif query.data == "blacklist_import_no":
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Blacklist import canceled."
-            )
-    except Exception as e:
-        exc_type, exc_value, exc_traceback = sys.exc_info()
-        await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-        logging.error(f"Error handling callback query: {e}")
-    return
-'''
+
 # ********* WHITELISTING *********
 
 
@@ -2890,20 +2672,6 @@ async def show_wholeft_loop(update: Update, context: CallbackContext):
     asyncio.create_task(show_wholeft(update, context))
     return
 
-'''
-#Command to purch the database of data from chats that are no longer active
-@authorized_admin_check
-async def get_blacklist_loop(update: Update, context: CallbackContext):
-    asyncio.create_task(get_blacklist(update, context))
-    return
-'''
-'''
-#Command to purch the database of data from chats that are no longer active
-@authorized_admin_check
-async def ban_from_blacklist_loop(update: Update, context: CallbackContext):
-    asyncio.create_task(ban_from_blacklist(update, context))
-    return
-'''
 
 #Command to purch the database of data from chats that are no longer active
 @is_admin_of_authorized_chat_check
@@ -2917,11 +2685,6 @@ async def set_backup_loop(update: Update, context: CallbackContext):
     asyncio.create_task(set_backup(update, context))
     return
 
-'''
-async def import_blacklist_callback_query_handler_loop(update: Update, context: CallbackContext):
-    asyncio.create_task(import_blacklist_callback_query_handler(update, context))
-    return
-'''
 
 @authorized_chat_check
 async def handle_message_loop(update: Update, context: CallbackContext):
@@ -2997,13 +2760,10 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop_chat_member_tracking))
     application.add_handler(CommandHandler("wholeft", show_wholeft_loop))
     application.add_handler(CommandHandler("noleavers", ban_leavers_mode_loop))
-    # application.add_handler(CommandHandler("blacklist", get_blacklist_loop))
-    # application.add_handler(CommandHandler("blban", ban_from_blacklist_loop))
     application.add_handler(CommandHandler("forgive", unban_loop))
     application.add_handler(CommandHandler("setbackup", set_backup_loop)) 
     application.add_handler(CommandHandler("restart", restart)) 
     application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
-    # application.add_handler(CallbackQueryHandler(import_blacklist_callback_query_handler_loop, pattern='^blacklist_import_.*'))
 
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
     application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
