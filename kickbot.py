@@ -217,6 +217,85 @@ async def authorize_chat_and_update_cache(chat_id, chat_title):
         logging.error(f"Unexpected error while authorizing chat {chat_id}: {e}")
     return False
 
+
+async def check_chat_admins_against_named_users(update, chat_title, chat_id) -> bool:
+    rt = 0
+    while rt < max_retries:
+        try:      
+            admins = await update.effective_chat.get_administrators()
+        
+        except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
+            logging.error(f"An access error occured in authorized_chat_check() for {chat_id} - {chat_title}. Cleaning databases.")
+            active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
+            if len(inactive_chats) > 0:
+                logging.warning("Found inactive chats. Cleaning database.\n")
+                logging.warning(inactive_str)
+                del_chats_from_db(inactive_chats)
+                logging.warning("Purging...\n")
+                logging.warning("Inactive channels deleted.\n")
+                logging.warning(active_str)  
+            return False
+        except Exception:
+            return False
+
+        try:
+            admin_ids = {admin.user.id for admin in admins}
+            set_admin_ids = set(admin_ids)
+            set_auth_admins = set(AUTHORIZED_ADMINS)
+
+            # If an authorized (named) admin is one of the chat admins, insert into cache and insert into DB as necessary
+            if set_auth_admins.intersection(set_admin_ids):
+                insert_authorized_chat(chat_id, chat_title)
+                chat_admins_cache[chat_id] = set_admin_ids # Cache admin ids from chat
+                insert_last_admin_update(chat_id) # Update most recent admin lookup
+                return True
+            else:
+                return False
+        except RetryAfter as e:
+            wait_seconds = e.retry_after
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
+            logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
+            await asyncio.sleep(wait_seconds)
+            rt += 1
+            if rt == max_retries:
+                logging.warning(f"Max retry limit reached. Authorized admin check error.")
+                return False
+        except Exception as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
+            logging.warning(f"An error occured in authorized_chat_check(): {e}")
+            return False
+        
+
+async def named_user_present_in_chat(chat_id, chat_title):
+    #Returns true if any user on the AUTHORIZED_ADMINS list is present in the chat
+    try:
+        if not AUTHORIZED_ADMINS:
+            return False
+        in_chat = False
+        for named_user in AUTHORIZED_ADMINS:
+            try:
+                member = await kickbot.get_chat_member(chat_id=chat_id, user_id=named_user)
+                if member.status in ["administrator", "creator", "member"]:
+                    in_chat = True
+                    break
+            except BadRequest:
+                continue
+            except Exception as e:
+                continue
+        if in_chat:
+            insert_authorized_chat(chat_id, chat_title)
+            insert_last_admin_update(chat_id) # Update most recent admin lookup
+            logging.warning(f"New authorized chat: {chat_title}.")
+            return True
+        else:
+            return False
+
+    except Exception as e:
+        logging.warning(f"An error occured in named_user_present_in_chat(): {e}")
+        return False
+
 # ********* WRAPPERS *********
 
 
@@ -262,54 +341,19 @@ def authorized_chat_check(handler_function):
             return await handler_function(update, context, *args, **kwargs)
         
         # If there are admins and this chat is not pre-approved, get the chat admins and see if there's a match.
-        rt = 0
-        while rt < max_retries:
-            try:      
-                admins = await update.effective_chat.get_administrators()
-            
-            except (BadRequest, BadRequestError, Forbidden, ChannelPrivateError) as e:
-                logging.error(f"An access error occured in authorized_chat_check() for {chat_id} - {chat_title}. Cleaning databases.")
-                active_chats, inactive_chats, active_str, inactive_str = await find_inactive_chats()
-                if len(inactive_chats) > 0:
-                    logging.warning("Found inactive chats. Cleaning database.\n")
-                    logging.warning(inactive_str)
-                    del_chats_from_db(inactive_chats)
-                    logging.warning("Purging...\n")
-                    logging.warning("Inactive channels deleted.\n")
-                    logging.warning(active_str)  
-                return
-            except Exception:
-                return
+        try:
 
-            try:
-                admin_ids = {admin.user.id for admin in admins}
-                set_admin_ids = set(admin_ids)
-                set_auth_admins = set(AUTHORIZED_ADMINS)
-
-                # If an authorized (named) admin is one of the chat admins, insert into cache and insert into DB as necessary
-                if set_auth_admins.intersection(set_admin_ids):
-                    insert_authorized_chat(chat_id, chat_title)
-                    chat_admins_cache[chat_id] = set_admin_ids # Cache admin ids from chat
-                    insert_last_admin_update(chat_id) # Update most recent admin lookup
-                    return await handler_function(update, context, *args, **kwargs)
-                else:
-                    return 
-            except RetryAfter as e:
-                wait_seconds = e.retry_after
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-                logging.warning(f"Got a RetryAfter error. Waiting for {wait_seconds} seconds...")
-                await asyncio.sleep(wait_seconds)
-                rt += 1
-                if rt == max_retries:
-                    logging.warning(f"Max retry limit reached. Message not sent.")
-                    return
-            except Exception as e:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
-                logging.warning(f"An error occured in authorized_chat_check(): {e}")
-                return
+            # named_user_is_admin = await check_chat_admins_against_named_users(update, chat_title, chat_id)
+            named_user_is_member = await named_user_present_in_chat(chat_id, chat_title)
+            if named_user_is_member:
+                return await handler_function(update, context, *args, **kwargs)
+        except Exception as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            await debug_to_chat(exc_type, exc_value, exc_traceback, update=update)
+            logging.warning(f"An error occured in authorized_chat_check(): {e}")
+            return
     return wrapper
+
 
 def is_admin_of_authorized_chat_check(handler_function):
     @wraps(handler_function)
@@ -1465,7 +1509,7 @@ async def lookup(update: Update, context: CallbackContext):
             # Search for the user in the list of participants
             kicked_user_last_joined = datetime.strptime(group_member_row['last_joined'], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=utc_timezone).strftime('%d %B, %Y - %H:%M:%S') if group_member_row['last_joined'] else 'N/A'
             kicked_chat_message=""
-            kicked_chat_message+=f"{kicked_user_name} - {chat_name}"
+            kicked_chat_message+=f"{kicked_user_name} - {chat_name}\n"
             # kicked_chat_message+=' - BLACKLISTED\n' if blacklist_row else '\n'
             kicked_chat_message+=f"KICKS from {chat_name}: {kicked_user_number_kicks}\n"
             kicked_chat_message+=f"BANS from {chat_name}: {group_member_row['times_banned'] if group_member_row['times_banned'] else 'N/A'}\n"
@@ -2617,7 +2661,8 @@ async def chat_status_loop(update: Update, context: CallbackContext):
 
 
 #Command to purch the database of data from chats that are no longer active
-@is_admin_of_authorized_chat_check
+# @is_admin_of_authorized_chat_check
+@authorized_admin_check
 async def lookup_loop(update: Update, context: CallbackContext):
     asyncio.create_task(lookup(update, context))
     return
@@ -2673,7 +2718,8 @@ async def show_wholeft_loop(update: Update, context: CallbackContext):
 
 
 #Command to purch the database of data from chats that are no longer active
-@is_admin_of_authorized_chat_check
+# @is_admin_of_authorized_chat_check
+@authorized_admin_check
 async def unban_loop(update: Update, context: CallbackContext):
     asyncio.create_task(unban(update, context))
     return
@@ -2734,7 +2780,7 @@ def main() -> None:
 
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
+    '''
     application.add_handler(CommandHandler("inactivekick", inactive_kick_loop))
     application.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
     application.add_handler(CommandHandler("quietkick", quiet_kick_loop))
@@ -2743,9 +2789,9 @@ def main() -> None:
     application.add_handler(CommandHandler("wl", show_whitelist_loop))
     application.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
     application.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
-
+    '''
     application.add_handler(CommandHandler("lurkinfo", lookup_loop))  
-
+    '''
     application.add_handler(CommandHandler("log", request_log_loop))     
     application.add_handler(CommandHandler("gcstats", chat_status_loop)) 
     application.add_handler(CommandHandler("start", start_command))
@@ -2761,11 +2807,11 @@ def main() -> None:
     application.add_handler(CommandHandler("restart", restart)) 
 
     application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
-    
+    '''
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
     application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
     application.add_error_handler(error)
-
+    
 
     # Run the bot until the user presses Ctrl-C
     try:
