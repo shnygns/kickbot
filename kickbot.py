@@ -168,10 +168,9 @@ async def update_chat_admins_cache(chat_id):
             chat_admins_cache[chat_id] = admin_ids
             insert_last_admin_update(chat_id)
             break
-
         except (BadRequest, Forbidden) as e:
             # Expecting deleted chats to get this error
-            logging.warning(f"Bad Request occurred in chat {chat_id}: Deleting from database.")
+            logging.warning(f"update_chat_admins_cache() - Error occurred for chat {chat_id}: {e}. Deleting from database.")
             del_chats_from_db([chat_id])
             break
         except (RetryAfter, TimedOut, NetworkError) as e:
@@ -843,7 +842,7 @@ async def process_chat_member_updates(chat_id, update: Update=None, context: Cal
 
         # Step 5: If ban_leavers_mode is on, ban anyone with a status of "left"
         ban_leavers_mode = get_ban_leavers_status(chat_id)
-        if ban_leavers_mode[0]==1:
+        if ban_leavers_mode and ban_leavers_mode[0]==1:
             last_scan = lookup_last_scan(chat_id)
             suspend_banning = (not last_scan) or (last_scan and (datetime.now(timezone.utc) - last_scan) > timedelta(minutes=10))
             
@@ -2780,7 +2779,7 @@ def main() -> None:
 
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
+    '''
     application.add_handler(CommandHandler("inactivekick", inactive_kick_loop))
     application.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
     application.add_handler(CommandHandler("quietkick", quiet_kick_loop))
@@ -2789,9 +2788,9 @@ def main() -> None:
     application.add_handler(CommandHandler("wl", show_whitelist_loop))
     application.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
     application.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
-
+    '''
     application.add_handler(CommandHandler("lurkinfo", lookup_loop))  
-
+    '''
     application.add_handler(CommandHandler("log", request_log_loop))     
     application.add_handler(CommandHandler("gcstats", chat_status_loop)) 
     application.add_handler(CommandHandler("start", start_command))
@@ -2807,7 +2806,7 @@ def main() -> None:
     application.add_handler(CommandHandler("restart", restart)) 
 
     application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
-
+    '''
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
     application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
     application.add_error_handler(error)
