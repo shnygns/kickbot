@@ -2779,7 +2779,7 @@ def main() -> None:
 
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    '''
+
     application.add_handler(CommandHandler("inactivekick", inactive_kick_loop))
     application.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
     application.add_handler(CommandHandler("quietkick", quiet_kick_loop))
@@ -2788,9 +2788,9 @@ def main() -> None:
     application.add_handler(CommandHandler("wl", show_whitelist_loop))
     application.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
     application.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
-    '''
+
     application.add_handler(CommandHandler("lurkinfo", lookup_loop))  
-    '''
+
     application.add_handler(CommandHandler("log", request_log_loop))     
     application.add_handler(CommandHandler("gcstats", chat_status_loop)) 
     application.add_handler(CommandHandler("start", start_command))
@@ -2806,7 +2806,7 @@ def main() -> None:
     application.add_handler(CommandHandler("restart", restart)) 
 
     application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
-    '''
+
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
     application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
     application.add_error_handler(error)
