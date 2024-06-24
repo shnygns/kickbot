@@ -88,7 +88,7 @@ from functools import wraps
 from tqdm import tqdm
 import aioschedule as schedule
 from telethon.sync import TelegramClient
-from telethon.errors import ChannelPrivateError, BadRequestError, UserAdminInvalidError, TimedOutError
+from telethon.errors import ChannelPrivateError, BadRequestError, UserAdminInvalidError, TimedOutError, UserDeletedError, UsernameInvalidError
 from telethon.tl.types import (
     ChannelParticipantAdmin, 
     ChannelParticipant, 
@@ -1415,8 +1415,15 @@ async def lookup(update: Update, context: CallbackContext):
         await check_telethon_connection()
         kicked_user = await telethon.get_entity(id_or_username)
         kicked_user_id = kicked_user.id
+
+    except UsernameInvalidError as e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        logging.error(f" Error getting entity information from username during lookup: {e}")
+        await context.bot.send_message(chat_id=issuer_user_id, text=f"Error looking up user {id_or_username} in Telegram.")
+        return
         
     except Exception as e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
         logging.error(f" Error getting entity and chat member information during lookup: {e}")
         await context.bot.send_message(chat_id=issuer_user_id, text=f"Error looking up user {id_or_username} in Telegram.")
         return
@@ -2480,11 +2487,11 @@ async def kick_inactive_users(update: Update, context: CallbackContext, pretend=
             logging.warning(f"Bad Request/Forbidden in chat_status() - Bot no longer in group.")
             return
 
-        if issuer_user_id not in admin_ids:
-            if not quiet:
-                await context.bot.send_message(chat_id=issuer_chat_id, text="You are not an admin in this channel.")
-            kick_started = False
-            return
+        #if issuer_user_id not in admin_ids:
+        #    if not quiet:
+        #        await context.bot.send_message(chat_id=issuer_chat_id, text="You are not an admin in this channel.")
+        #    kick_started = False
+        #    return
 
         logging.warning(f"\n\nHEADS UP! A {pretend_str if pretend else 'LIVE '}inactivity purge has been started in {issuer_chat_name} ({issuer_chat_id})\n\n")
 
@@ -2780,6 +2787,15 @@ def main() -> None:
     # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
+    # Commands to leave live for testing
+    application.add_handler(CommandHandler("lurkinfo", lookup_loop))  
+    application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
+    application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
+    application.add_error_handler(error)
+
+
+    # All other commands
     application.add_handler(CommandHandler("inactivekick", inactive_kick_loop))
     application.add_handler(CommandHandler("pretendkick", pretend_kick_loop))
     application.add_handler(CommandHandler("quietkick", quiet_kick_loop))
@@ -2788,9 +2804,6 @@ def main() -> None:
     application.add_handler(CommandHandler("wl", show_whitelist_loop))
     application.add_handler(CommandHandler("wl_del", dewhitelist_user_loop))
     application.add_handler(CommandHandler("3strikes", three_strikes_mode_loop)) 
-
-    application.add_handler(CommandHandler("lurkinfo", lookup_loop))  
-
     application.add_handler(CommandHandler("log", request_log_loop))     
     application.add_handler(CommandHandler("gcstats", chat_status_loop)) 
     application.add_handler(CommandHandler("start", start_command))
@@ -2805,13 +2818,8 @@ def main() -> None:
     application.add_handler(CommandHandler("setbackup", set_backup_loop)) 
     application.add_handler(CommandHandler("restart", restart)) 
 
-    application.add_handler(CallbackQueryHandler(button_click, pattern='^setbackup_.*'))
 
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message_loop))
-    application.add_handler(ChatMemberHandler(handle_new_member_loop, ChatMemberHandler.CHAT_MEMBER))
-    application.add_error_handler(error)
     
-
     # Run the bot until the user presses Ctrl-C
     try:
         kickbot = application.bot
